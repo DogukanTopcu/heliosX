@@ -29,7 +29,7 @@ Her plan kendi `.md` dosyasında ayrıntılı olarak açıklanmıştır.
 |---|---|---|---|
 | P8 | Web Kontrol Paneli | [P8-web-control.md](P8-web-control.md) | Tamamlandı |
 | P9 | Kalman Filtresi ile Gelişmiş Tahmin | [P9-kalman.md](P9-kalman.md) | Tamamlandı |
-| P10 | Gece Modu / Adaptif Pozlama | [P10-night-mode.md](P10-night-mode.md) | Bekliyor |
+| P10 | Gece Modu / Adaptif Pozlama | [P10-night-mode.md](P10-night-mode.md) | Tamamlandı |
 
 ## Plan Bağımlılık Sırası
 

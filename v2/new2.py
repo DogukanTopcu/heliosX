@@ -41,6 +41,14 @@ TARGET_FPS = 30
 EXPOSURE_TIME_US = 5000               # mikrosaniye (5ms shutter). 0 = auto
 ANALOGUE_GAIN = 6.0                   # isiklandirma kompansasyonu (1-16)
 
+# Adaptif pozlama — loş/değişken ışık ortamı için otomatik ayar
+BRIGHTNESS_TARGET  = 80               # hedef ortalama frame parlaklığı (0-255)
+BRIGHTNESS_WINDOW  = 90               # her 90 frame'de (~3 sn) bir güncelle
+EXPOSURE_MIN_US    = 3000             # minimum shutter (hareket bulanıklığı sınırı)
+EXPOSURE_MAX_US    = 25000            # maksimum shutter (25ms)
+GAIN_MIN           = 2.0
+GAIN_MAX           = 12.0
+
 # Preprocessing
 BLUR_KERNEL = 5
 CLAHE_CLIP = 2.0
@@ -153,6 +161,33 @@ def log(msg: str) -> None:
 
 import json as _json
 import datetime as _dt
+
+_current_exposure: float = float(EXPOSURE_TIME_US)
+_current_gain: float = ANALOGUE_GAIN
+
+
+def _adjust_exposure(cam, brightness: float) -> None:
+    global _current_exposure, _current_gain
+    if EXPOSURE_TIME_US == 0:
+        return  # otomatik AE açıksa dokunma
+
+    error = BRIGHTNESS_TARGET - brightness  # pozitif = çok karanlık
+
+    if error > 10:
+        _current_exposure = min(_current_exposure * 1.15, EXPOSURE_MAX_US)
+    elif error < -10:
+        _current_exposure = max(_current_exposure * 0.87, EXPOSURE_MIN_US)
+
+    if _current_exposure >= EXPOSURE_MAX_US and error > 15:
+        _current_gain = min(_current_gain * 1.1, GAIN_MAX)
+    elif _current_exposure <= EXPOSURE_MIN_US and error < -15:
+        _current_gain = max(_current_gain * 0.9, GAIN_MIN)
+
+    cam.set_controls({
+        "ExposureTime": int(_current_exposure),
+        "AnalogueGain": _current_gain,
+    })
+    log(f"[EXPOSURE] parlaklık={brightness:.0f} exp={_current_exposure:.0f}µs gain={_current_gain:.1f}")
 
 
 def _load_calibration() -> None:
@@ -1417,6 +1452,8 @@ def main() -> None:
             if frame_idx % 30 == 0 and len(_frame_times) >= 2:
                 elapsed = _frame_times[-1] - _frame_times[0]
                 fps = (len(_frame_times) - 1) / elapsed if elapsed > 0 else 0.0
+            if frame_idx % BRIGHTNESS_WINDOW == 0 and frame_idx > WARMUP_FRAMES:
+                _adjust_exposure(picam2, float(np.mean(gray)))
             if frame_idx % 300 == 0:
                 log(f"FPS~{fps:.1f} trk:{len(tracker.tracks)} "
                     f"dets:{len(dets)} suppr_frames:{n_suppressed}")
