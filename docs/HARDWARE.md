@@ -4,17 +4,17 @@
 
 | Component | Model | Notes |
 |---|---|---|
-| SBC | Raspberry Pi 5 (4 GB or 8 GB) | Requires Pi 5 — lgpio not available on Pi 4 without extra config |
-| Camera | Raspberry Pi Camera Module 3 | Connected via CSI ribbon cable |
-| Pan servo | MG90S | Metal gear recommended for durability |
-| Tilt servo | MG90S | Same model as pan |
-| Laser | 5 mW 650 nm laser module (KY-008 or similar) | Operates at 3.3–5 V |
-| Pan-tilt bracket | Two-axis 3D-printed or off-the-shelf bracket | Must fit MG90S horns |
-| Power supply | 5 V / 5 A USB-C | Servos draw ~250 mA each under load |
+| SBC | Raspberry Pi 5 (4 GB or 8 GB) | Pi 5 varsayılmıştır |
+| Camera | Raspberry Pi Camera Module 3 | CSI ribbon ile bağlı |
+| Pan servo | MG90S | Metal gear tercih edilir |
+| Tilt servo | MG90S | Pan ile aynı sınıf |
+| Laser | 5 mW 650 nm laser module (KY-008 veya benzeri) | Besleme varyanta göre değişebilir |
+| Pan-tilt bracket | 2 eksenli mekanik braket | MG90S horn uyumu gerekli |
+| Power supply | 5 V / 5 A USB-C | Servo yükünde pay bırakılmalı |
 
 ## GPIO Pinout (BCM numbering)
 
-```
+```text
  3V3  (1) (2)  5V
  SDA  (3) (4)  5V
  SCL  (5) (6)  GND
@@ -39,18 +39,34 @@ GPIO26(37) (38) GPIO20
 
 ## Wiring Summary
 
-| Signal | GPIO (BCM) | Physical Pin | Wire colour (suggested) |
+| Signal | GPIO (BCM) | Physical Pin | Suggested colour |
 |---|---|---|---|
 | Pan servo signal | 12 | 32 | Yellow |
 | Tilt servo signal | 13 | 33 | Yellow |
 | Laser signal | 14 | 8 | Green |
 | Trigger/relay | 17 | 11 | Blue |
-| Servo / laser GND | GND | 34, 6, 9… | Black |
+| Shared ground | GND | 34, 6, 9… | Black |
 | Servo / laser VCC | 5 V | 2 or 4 | Red |
 
-> **Servo power:** MG90S servos can be powered directly from the Pi's 5 V rail for bench testing, but a dedicated 5 V BEC or USB supply on the servo rail is recommended for prolonged use to avoid brownouts.
+Tüm topraklar ortak olmalıdır: Pi GND, servo besleme GND ve lazer GND.
 
-## MG90S Servo Specification
+## Servo convention used in this repo
+
+- Kodda kullanılan pulse aralığı: `0.5–2.5 ms`
+- Pan gösterge açısı: `-45°..45°`, `0° = merkez`
+- Tilt gösterge açısı: `0°..75°`, `0° = fiziksel alt limit`
+- Tilt dönüşümünde `TILT_ZERO_OFFSET = 25.0` uygulanır
+
+Formüller:
+
+```python
+pan_servo_value  = pan_deg / 90.0
+tilt_servo_value = ((tilt_deg + 25.0) / 90.0) - 1.0
+```
+
+Bu eşleşme `v2/new2.py`, `motor/manual-control5.py` ve `motor/servo-angle-finder.py` ile uyumludur.
+
+## MG90S notes
 
 | Parameter | Value |
 |---|---|
@@ -58,39 +74,33 @@ GPIO26(37) (38) GPIO20
 | Stall torque | 1.8 kg·cm @ 4.8 V |
 | Speed | 0.1 s / 60° @ 4.8 V |
 | PWM frequency | 50 Hz |
-| Pulse width range | 1.0–2.0 ms (physical safe range) |
+| Vendor nominal pulse width | 1.0–2.0 ms |
 | Angular range | ~180° |
 
-gpiozero mapping used in all scripts:
+Repo içindeki fiziksel kalibrasyon daha geniş pulse aralığı kullanır:
 
 ```python
-min_pulse_width = 0.001   # 1 ms → 0° (servo min)
-max_pulse_width = 0.002   # 2 ms → 180° (servo max)
+min_pulse_width = 0.0005
+max_pulse_width = 0.0025
 ```
 
-Value formula: `servo.value = (degrees / 90.0) - 1.0`
+## Laser module
 
-## Laser Module (KY-008)
+- Control pin: GPIO 14
+- `gpiozero.LED` olarak dijital aç/kapat sürülür
+- GPIO yalnızca kontrol sinyaline gider
+- Besleme hattı modül tipine göre 3.3 V veya 5 V olabilir
+- **Class 2/3A laser — doğrudan göze tutulmamalı**
 
-- Control pin: signal wire → GPIO 14
-- Driven as `gpiozero.LED` (digital on/off)
-- The module has an onboard current-limiting resistor; connect signal directly to GPIO
-- Supply voltage: 5 V (VCC pin) or 3.3 V (some variants)
-- **Class 2/3A laser — avoid direct eye exposure**
+## Power notes
 
-## Camera Mounting
+- Bench test sırasında Pi 5V hattı kullanılabilir
+- Uzun süreli kullanımda harici 5V servo rail daha güvenlidir
+- Servo ani akımı brownout üretebilir
 
-The Camera Module 3 is mounted on the pan-tilt bracket so its optical axis aligns with the laser axis. Calibrate the offset between camera centre and laser dot after assembly (see `docs/TUNING.md`).
+## Driver requirement
 
-## Driver Requirements (Pi 5)
-
-Pi 5 uses the `lgpio` backend — the old `pigpio` daemon is not required:
-
-```bash
-sudo apt install -y python3-lgpio
-```
-
-Force `lgpio` in all scripts before importing gpiozero:
+Pi 5 üzerinde `gpiozero` importundan önce `lgpio` zorlanmalıdır:
 
 ```python
 import os

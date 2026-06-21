@@ -9,6 +9,7 @@ import time
 import threading
 import os
 import logging
+import argparse
 from collections import deque
 from dataclasses import dataclass, field
 from http import server
@@ -16,7 +17,12 @@ from socketserver import ThreadingMixIn
 
 import cv2
 import numpy as np
-from picamera2 import Picamera2
+try:
+    from picamera2 import Picamera2
+    HAS_PICAMERA2 = True
+except Exception:
+    Picamera2 = None
+    HAS_PICAMERA2 = False
 
 # Raspberry Pi 5 için yerel lgpio sürücüsünü zorunlu kılıyoruz
 os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
@@ -106,11 +112,19 @@ PAN_PIN = 12                          # Servo Pan (Sağ-Sol) GPIO pini
 TILT_PIN = 13                         # Servo Tilt (Yukarı-Aşağı) GPIO pini
 LAZER_PIN = 14                        # Lazer Modülü GPIO pini
 
-# Servo mekanik hareket sınırları — manual-control5.py ile fiziksel limitleri test edip ayarla
-PAN_MIN_DEG  = 30.0
-PAN_MAX_DEG  = 150.0
-TILT_MIN_DEG = 45.0
-TILT_MAX_DEG = 135.0
+# Servo mekanik hareket sınırları ve konvansiyon — manual-control5.py / servo-angle-finder.py
+# ile fiziksel olarak kalibre edildi. Pulse aralığı 0.5–2.5 ms (klon MG90S).
+# Pan:  fiziksel açı, 0° = merkez (+sağ/−sol)
+# Tilt: 0° = fiziksel alt limit; servo sinyaline çevrilirken TILT_ZERO_OFFSET eklenir
+PAN_MIN_DEG  = -45.0
+PAN_MAX_DEG  =  45.0
+TILT_MIN_DEG =   0.0
+TILT_MAX_DEG =  75.0
+TILT_ZERO_OFFSET = 25.0    # gösterge 0° = fiziksel alt limit (25° servo konumu)
+PAN_HOME_DEG  = 0.0        # boşta/merkez pan
+TILT_HOME_DEG = 0.0        # boşta/alt-limit tilt (başlangıç konumu)
+SERVO_MIN_PW = 0.0005      # 0.5 ms
+SERVO_MAX_PW = 0.0025      # 2.5 ms
 
 # Adaptif servo kazanımı — hata büyükse hızlı, küçükse hassas
 KP_BASE          = 0.020   # küçük hata (<5 px) — hassas ince ayar modu
@@ -127,6 +141,22 @@ CALIB_PATH = "/home/heliosx/v2/calibration.json"
 CAMERA_FOV_H_DEG = 66.0
 CAMERA_FOV_V_DEG = 49.0
 
+# Otomatik kalibrasyon — lazer noktasını görüntüde bulup piksel→servo haritası fit eder
+AUTOCAL_GRID_PAN   = 6      # pan ekseninde tarama noktası sayısı
+AUTOCAL_GRID_TILT  = 5      # tilt ekseninde tarama noktası sayısı
+AUTOCAL_SETTLE_FR  = 18     # her noktada servo+kamera oturana dek beklenen frame (~0.6s@30fps)
+AUTOCAL_REF_FR     = 8      # referans (lazer kapalı) frame sayısı
+AUTOCAL_MEASURE_FR = 6      # settle sonrası kaç frame lazer noktası toplanacak
+AUTOCAL_MAX_JITTER_PX = 6.0 # bir grid noktasındaki lazer gözlemlerinin izinli saçılımı
+LASER_RED_MIN      = 45     # kırmızı baskınlık eşiği (R - max(G,B)), referanssız önizleme
+LASER_DIFF_MIN     = 40     # lazer açık-kapalı parlaklık farkı eşiği (doygun nokta da yakalanır)
+LASER_MIN_AREA     = 2      # px², bu alandan küçük lekeler yok sayılır
+AUTOCAL_MIN_SAMPLES = 12    # polinom fit'i kabul etmek için minimum nokta
+AUTOCAL_MAX_RMS_PAN_DEG = 6.0
+AUTOCAL_MAX_RMS_TILT_DEG = 6.0
+AUTOCAL_MIN_PX_SPAN_X = 120.0
+AUTOCAL_MIN_PX_SPAN_Y = 90.0
+
 # Stream / log
 ENABLE_STREAM = True
 STREAM_PORT = 8080
@@ -134,6 +164,7 @@ STREAM_QUALITY = 75
 WARMUP_FRAMES = 15                    # detection bu kadar frame sonra basla
 LOG_TO_FILE = True
 LOG_PATH = "/home/heliosx/v2/detections.log"
+DRY_RUN_BG = 235
 
 # =========================================================================
 # LOGGING KURULUMU (sabitlerden sonra — LOG_TO_FILE ve LOG_PATH burada okunuyor)
@@ -166,12 +197,15 @@ _current_exposure: float = float(EXPOSURE_TIME_US)
 _current_gain: float = ANALOGUE_GAIN
 
 
-def _adjust_exposure(cam, brightness: float) -> None:
+def _adjust_exposure(cam, brightness: float) -> bool:
+    """Pozlamayı parlaklığa göre ayarlar. Donanım kontrolü değiştiyse True döner
+    (çağıran taraf frame-diff'i sıfırlamak için bunu kullanır — B2 çatışması)."""
     global _current_exposure, _current_gain
     if EXPOSURE_TIME_US == 0:
-        return  # otomatik AE açıksa dokunma
+        return False  # otomatik AE açıksa dokunma
 
     error = BRIGHTNESS_TARGET - brightness  # pozitif = çok karanlık
+    prev_exp, prev_gain = _current_exposure, _current_gain
 
     if error > 10:
         _current_exposure = min(_current_exposure * 1.15, EXPOSURE_MAX_US)
@@ -183,15 +217,20 @@ def _adjust_exposure(cam, brightness: float) -> None:
     elif _current_exposure <= EXPOSURE_MIN_US and error < -15:
         _current_gain = max(_current_gain * 0.9, GAIN_MIN)
 
+    if int(_current_exposure) == int(prev_exp) and abs(_current_gain - prev_gain) < 1e-3:
+        return False  # kayda değer değişiklik yok, kameraya dokunma
+
     cam.set_controls({
         "ExposureTime": int(_current_exposure),
         "AnalogueGain": _current_gain,
     })
     log(f"[EXPOSURE] parlaklık={brightness:.0f} exp={_current_exposure:.0f}µs gain={_current_gain:.1f}")
+    return True
 
 
 def _load_calibration() -> None:
     global LASER_OFFSET_PX_X, LASER_OFFSET_PX_Y
+    global HAS_PIXEL_MAP, MAP_PAN_COEF, MAP_TILT_COEF
     if not os.path.exists(CALIB_PATH):
         log("Kalibrasyon dosyası yok, offset=(0,0) kullanılıyor.")
         return
@@ -200,10 +239,257 @@ def _load_calibration() -> None:
             data = _json.load(f)
         LASER_OFFSET_PX_X = float(data.get("laser_offset_px_x", 0.0))
         LASER_OFFSET_PX_Y = float(data.get("laser_offset_px_y", 0.0))
-        log(f"Kalibrasyon yüklendi: offset=({LASER_OFFSET_PX_X:.1f}, {LASER_OFFSET_PX_Y:.1f})px"
-            f" [{data.get('calibrated_at', '?')}]")
+        if "pan_coef" in data and "tilt_coef" in data:
+            MAP_PAN_COEF  = np.array(data["pan_coef"],  dtype=np.float64)
+            MAP_TILT_COEF = np.array(data["tilt_coef"], dtype=np.float64)
+            HAS_PIXEL_MAP = MAP_PAN_COEF.shape == (6,) and MAP_TILT_COEF.shape == (6,)
+            rms_pan = float(data.get("rms_pan_deg", 999.0))
+            rms_tilt = float(data.get("rms_tilt_deg", 999.0))
+            n_samples = int(data.get("n_samples", 0))
+            px_span_x = float(data.get("px_span_x", 0.0))
+            px_span_y = float(data.get("px_span_y", 0.0))
+            if HAS_PIXEL_MAP and (
+                n_samples < AUTOCAL_MIN_SAMPLES
+                or px_span_x < AUTOCAL_MIN_PX_SPAN_X
+                or px_span_y < AUTOCAL_MIN_PX_SPAN_Y
+                or rms_pan > AUTOCAL_MAX_RMS_PAN_DEG
+                or rms_tilt > AUTOCAL_MAX_RMS_TILT_DEG
+            ):
+                log(f"[KALİBRASYON] Piksel haritası REDDEDİLDİ "
+                    f"(n={n_samples}, span={px_span_x:.0f}x{px_span_y:.0f}px, "
+                    f"rms={rms_pan}/{rms_tilt}°). "
+                    "Offset moduna düşülüyor.")
+                HAS_PIXEL_MAP = False
+                MAP_PAN_COEF = None
+                MAP_TILT_COEF = None
+        if HAS_PIXEL_MAP:
+            log(f"Piksel→servo haritası yüklendi "
+                f"(n={data.get('n_samples','?')}, "
+                f"span={data.get('px_span_x','?')}x{data.get('px_span_y','?')}px, "
+                f"rms={data.get('rms_pan_deg','?')}/{data.get('rms_tilt_deg','?')}°) "
+                f"[{data.get('calibrated_at', '?')}]")
+        else:
+            log(f"Kalibrasyon yüklendi: offset=({LASER_OFFSET_PX_X:.1f}, {LASER_OFFSET_PX_Y:.1f})px"
+                f" [{data.get('calibrated_at', '?')}] — piksel haritası yok, eski offset modu.")
     except Exception as e:
         log(f"Kalibrasyon dosyası okunamadı: {e} — offset=(0,0) kullanılıyor.")
+
+
+def _detect_laser_dot(small_bgr, ref_bgr=None):
+    """Process çözünürlüklü BGR frame'de lazer noktasını bulur.
+    ref_bgr (lazer kapalı referans) verilirse: lazer açık-kapalı PARLAKLIK farkı kullanılır
+    — doygun (beyaz çekirdekli) noktayı da yakalar, sahnedeki statik nesneleri eler.
+    Yoksa: salt kırmızı baskınlığı (önizleme için). Dönüş: (px, py, area) veya None."""
+    if ref_bgr is not None:
+        diff = cv2.absdiff(small_bgr, ref_bgr)
+        bright = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY).astype(np.int16)
+        b, g, r = cv2.split(diff.astype(np.int16))
+        redness = np.clip(r - np.maximum(g, b), 0, 255)
+        score = np.clip(bright + redness, 0, 255).astype(np.uint8)
+        thr = LASER_DIFF_MIN
+    else:
+        b, g, r = cv2.split(small_bgr.astype(np.int16))
+        score = np.clip(r - np.maximum(g, b), 0, 255).astype(np.uint8)
+        thr = LASER_RED_MIN
+    _, mask = cv2.threshold(score, thr, 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    n, _, stats, cent = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    best, best_area = None, 0
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < LASER_MIN_AREA:
+            continue
+        if area > best_area:
+            best_area = area
+            best = (float(cent[i][0]), float(cent[i][1]), area)
+    return best
+
+
+def _poly_terms(px: float, py: float) -> np.ndarray:
+    """İkinci derece polinom tasarım vektörü: [1, px, py, px², py², px·py]"""
+    return np.array([1.0, px, py, px * px, py * py, px * py], dtype=np.float64)
+
+
+def _fit_pixel_to_servo(samples: list[tuple[float, float, float, float]]):
+    """samples: (pan_deg, tilt_deg, px, py). Piksel→açı için ikinci derece polinom fit.
+    Dönüş: katsayılar + RMS artık hata içeren dict, veya yetersiz veri varsa None."""
+    if len(samples) < 6:
+        return None
+    pan  = np.array([s[0] for s in samples], dtype=np.float64)
+    tilt = np.array([s[1] for s in samples], dtype=np.float64)
+    pxs = np.array([s[2] for s in samples], dtype=np.float64)
+    pys = np.array([s[3] for s in samples], dtype=np.float64)
+    A = np.array([_poly_terms(s[2], s[3]) for s in samples], dtype=np.float64)
+    pan_coef,  *_ = np.linalg.lstsq(A, pan,  rcond=None)
+    tilt_coef, *_ = np.linalg.lstsq(A, tilt, rcond=None)
+    rms_pan  = float(np.sqrt(np.mean((A @ pan_coef  - pan)  ** 2)))
+    rms_tilt = float(np.sqrt(np.mean((A @ tilt_coef - tilt) ** 2)))
+    return {
+        "pan_coef":  pan_coef.tolist(),
+        "tilt_coef": tilt_coef.tolist(),
+        "rms_pan_deg":  round(rms_pan, 3),
+        "rms_tilt_deg": round(rms_tilt, 3),
+        "n_samples": len(samples),
+        "px_span_x": round(float(np.max(pxs) - np.min(pxs)), 1),
+        "px_span_y": round(float(np.max(pys) - np.min(pys)), 1),
+    }
+
+
+def pixel_to_servo(px: float, py: float) -> tuple[float, float]:
+    """Hedef pikselini, lazeri o piksele götürecek (pan, tilt) açısına çevirir."""
+    f = _poly_terms(px, py)
+    return float(f @ MAP_PAN_COEF), float(f @ MAP_TILT_COEF)
+
+
+def _save_pixel_map(result: dict) -> None:
+    """Otomatik kalibrasyon sonucunu calibration.json'a yazar ve haritayı aktive eder."""
+    global HAS_PIXEL_MAP, MAP_PAN_COEF, MAP_TILT_COEF
+    data = {
+        "mode":              "pixel_servo_poly2",
+        "pan_coef":          result["pan_coef"],
+        "tilt_coef":         result["tilt_coef"],
+        "rms_pan_deg":       result["rms_pan_deg"],
+        "rms_tilt_deg":      result["rms_tilt_deg"],
+        "n_samples":         result["n_samples"],
+        "px_span_x":         result.get("px_span_x"),
+        "px_span_y":         result.get("px_span_y"),
+        "calibrated_at":     _dt.datetime.now().isoformat(timespec="seconds"),
+        "process_resolution": f"{PROCESS_W}x{PROCESS_H}",
+    }
+    with open(CALIB_PATH, "w") as f:
+        _json.dump(data, f, indent=2)
+    MAP_PAN_COEF  = np.array(result["pan_coef"],  dtype=np.float64)
+    MAP_TILT_COEF = np.array(result["tilt_coef"], dtype=np.float64)
+    HAS_PIXEL_MAP = True
+    log(f"[OTO-KALİBRASYON] Harita kaydedildi: n={result['n_samples']} "
+        f"rms={result['rms_pan_deg']}/{result['rms_tilt_deg']}°")
+
+
+def _is_pixel_map_usable(result: dict | None) -> tuple[bool, str]:
+    if result is None:
+        return False, "fit oluşturulamadı"
+    n_samples = int(result.get("n_samples", 0))
+    rms_pan = float(result.get("rms_pan_deg", 999.0))
+    rms_tilt = float(result.get("rms_tilt_deg", 999.0))
+    px_span_x = float(result.get("px_span_x", 0.0))
+    px_span_y = float(result.get("px_span_y", 0.0))
+    if n_samples < AUTOCAL_MIN_SAMPLES:
+        return False, f"çok az örnek ({n_samples} < {AUTOCAL_MIN_SAMPLES})"
+    if px_span_x < AUTOCAL_MIN_PX_SPAN_X or px_span_y < AUTOCAL_MIN_PX_SPAN_Y:
+        return False, (f"örnek yayılımı yetersiz "
+                       f"(span={px_span_x:.0f}x{px_span_y:.0f}px < "
+                       f"{AUTOCAL_MIN_PX_SPAN_X:.0f}x{AUTOCAL_MIN_PX_SPAN_Y:.0f}px)")
+    if rms_pan > AUTOCAL_MAX_RMS_PAN_DEG or rms_tilt > AUTOCAL_MAX_RMS_TILT_DEG:
+        return False, (f"yüksek RMS hata "
+                       f"({rms_pan:.1f}/{rms_tilt:.1f}° > "
+                       f"{AUTOCAL_MAX_RMS_PAN_DEG:.1f}/{AUTOCAL_MAX_RMS_TILT_DEG:.1f}°)")
+    return True, "ok"
+
+
+def _summarize_dot_samples(dots: list[tuple[float, float, float]]) -> tuple[tuple[float, float, float] | None, str | None]:
+    if len(dots) < max(3, AUTOCAL_MEASURE_FR // 2):
+        return None, f"yetersiz gözlem ({len(dots)})"
+    xs = np.array([d[0] for d in dots], dtype=np.float64)
+    ys = np.array([d[1] for d in dots], dtype=np.float64)
+    areas = np.array([d[2] for d in dots], dtype=np.float64)
+    mean_x = float(np.mean(xs))
+    mean_y = float(np.mean(ys))
+    mean_area = float(np.mean(areas))
+    jitter = float(np.sqrt(np.mean((xs - mean_x) ** 2 + (ys - mean_y) ** 2)))
+    if jitter > AUTOCAL_MAX_JITTER_PX:
+        return None, f"yüksek jitter ({jitter:.1f}px)"
+    return (mean_x, mean_y, mean_area), None
+
+
+class AutoCalibrator:
+    """Servoları ızgarada gezdirip her noktada lazer noktasını tespit eder,
+    piksel→servo haritasını fit eder. Main loop her frame'de update() çağırır;
+    dönen dict main loop'a hangi açıya gidileceğini ve lazer durumunu söyler."""
+
+    def __init__(self) -> None:
+        pans  = [PAN_MIN_DEG  + (PAN_MAX_DEG  - PAN_MIN_DEG)  * i / (AUTOCAL_GRID_PAN  - 1)
+                 for i in range(AUTOCAL_GRID_PAN)]
+        tilts = [TILT_MIN_DEG + (TILT_MAX_DEG - TILT_MIN_DEG) * j / (AUTOCAL_GRID_TILT - 1)
+                 for j in range(AUTOCAL_GRID_TILT)]
+        # Yılan (boustrophedon) sıralama — satırlar arası büyük sıçramayı azaltır
+        self.grid: list[tuple[float, float]] = []
+        for j, t in enumerate(tilts):
+            row = pans if j % 2 == 0 else list(reversed(pans))
+            self.grid += [(p, t) for p in row]
+        self.i = 0
+        self.samples: list[tuple[float, float, float, float]] = []
+        self.ref = None
+        self.phase = "ref"
+        self.counter = AUTOCAL_REF_FR
+        self.status = "Referans alınıyor (lazer kapalı)…"
+        self.result = None
+        self.dot_samples: list[tuple[float, float, float]] = []
+        self.last_dot: tuple[float, float, float] | None = None
+
+    def update(self, small_bgr) -> dict:
+        n = len(self.grid)
+        if self.phase == "ref":
+            self.counter -= 1
+            if self.counter <= 0:
+                self.ref = small_bgr.copy()
+                self.phase = "settle"
+                self.counter = AUTOCAL_SETTLE_FR
+                self.dot_samples = []
+                p, t = self.grid[self.i]
+                self.status = f"Tarama 1/{n}"
+                return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+            return {"laser": False, "done": False, "status": self.status}
+
+        if self.phase == "settle":
+            self.counter -= 1
+            p, t = self.grid[self.i]
+            if self.counter > 0:
+                return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+            self.phase = "measure"
+            self.counter = AUTOCAL_MEASURE_FR
+            self.dot_samples = []
+            self.status = f"Tarama {self.i + 1}/{n} ölçülüyor"
+            return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+
+        if self.phase == "measure":
+            p, t = self.grid[self.i]
+            dot = _detect_laser_dot(small_bgr, self.ref)
+            if dot is not None:
+                self.dot_samples.append(dot)
+                self.last_dot = dot
+            self.counter -= 1
+            if self.counter > 0:
+                found = len(self.dot_samples)
+                self.status = f"Tarama {self.i + 1}/{n} ölçülüyor ({found}/{AUTOCAL_MEASURE_FR})"
+                return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+
+            summary, err = _summarize_dot_samples(self.dot_samples)
+            if summary is not None:
+                self.samples.append((p, t, summary[0], summary[1]))
+                log(f"[OTO-KAL] {self.i + 1}/{n}: pan={p:.0f}° tilt={t:.0f}° "
+                    f"-> lazer px=({summary[0]:.1f},{summary[1]:.1f}) alan={summary[2]:.1f} "
+                    f"obs={len(self.dot_samples)}")
+            else:
+                reason = err or "bilinmeyen hata"
+                seen = len(self.dot_samples)
+                log(f"[OTO-KAL] {self.i + 1}/{n}: pan={p:.0f}° tilt={t:.0f}° "
+                    f"-> RED ({reason}, obs={seen})")
+            self.i += 1
+            if self.i >= n:
+                self.phase = "done"
+                self.result = _fit_pixel_to_servo(self.samples)
+                return {"laser": False, "done": True,
+                        "status": f"Bitti — {len(self.samples)}/{n} nokta bulundu",
+                        "result": self.result}
+            np_, nt = self.grid[self.i]
+            self.phase = "settle"
+            self.counter = AUTOCAL_SETTLE_FR
+            self.dot_samples = []
+            self.status = f"Tarama {self.i + 1}/{n} ({len(self.samples)} nokta bulundu)"
+            return {"pan": np_, "tilt": nt, "laser": True, "done": False, "status": self.status}
+
+        return {"laser": False, "done": True, "status": self.status, "result": self.result}
 
 
 def _save_calibration(offset_px_x: float, offset_px_y: float,
@@ -232,11 +518,11 @@ def _save_calibration(offset_px_x: float, offset_px_y: float,
 data_lock = threading.Lock()
 is_running = True
 
-# Motor Açı Kontrolü (Başlangıç: 90 derece / Tam Merkez)
-target_pan_deg = 90.0
-target_tilt_deg = 90.0
-current_pan_deg = 90.0
-current_tilt_deg = 90.0
+# Motor Açı Kontrolü (Başlangıç: pan merkez 0°, tilt alt limit 0°)
+target_pan_deg = PAN_HOME_DEG
+target_tilt_deg = TILT_HOME_DEG
+current_pan_deg = PAN_HOME_DEG
+current_tilt_deg = TILT_HOME_DEG
 
 # Akıllı Lazer Takip Durum Makinesi Değişkenleri
 current_target_id = None    # Şu an kilitlenilen sineğin benzersiz ID'si
@@ -246,6 +532,13 @@ killed_flies = set()        # 3 saniye boyunca vurularak imha edilen sineklerin 
 # Kalibrasyon modu
 calibrating: bool = False
 calib_click_px: tuple[float, float] | None = None
+auto_cal_active: bool = False          # web handler bunu set eder, main loop yakalar
+auto_cal_status: str = ""              # otomatik kalibrasyon ilerleme mesajı (UI için)
+
+# Piksel→servo açısı haritası (otomatik kalibrasyondan; ikinci derece polinom katsayıları)
+HAS_PIXEL_MAP: bool = False
+MAP_PAN_COEF = None                    # np.ndarray (6,) — [1, px, py, px², py², px·py]
+MAP_TILT_COEF = None
 
 # Web handler'ların thread-safe okuyabileceği durum snapshot'ı
 web_status: dict = {}
@@ -254,10 +547,94 @@ web_status: dict = {}
 pan_servo = None
 tilt_servo = None
 lazer = None
+sim_laser_on = False
 
-def deg_to_servo_val(deg):
-    """ 0-180 dereceyi gpiozero'nun -1.0 ile 1.0 skalasına çevirir """
-    return (deg / 90.0) - 1.0
+
+def pulse_output(device, duration_s: float = 0.05) -> None:
+    if device is None:
+        return
+
+    def _pulse():
+        try:
+            device.on()
+            time.sleep(duration_s)
+        finally:
+            device.off()
+
+    threading.Thread(target=_pulse, daemon=True).start()
+
+
+class SyntheticCamera:
+    """Picamera2 yerine kuru çalışma için basit hareketli sahne üretir."""
+
+    def __init__(self) -> None:
+        self.w = CAPTURE_W
+        self.h = CAPTURE_H
+        self.frame_idx = 0
+
+    def create_video_configuration(self, main=None, controls=None, queue=False):
+        if main and "size" in main:
+            self.w, self.h = main["size"]
+        return {"main": {"size": (self.w, self.h)}, "controls": controls or {}}
+
+    def configure(self, cfg) -> None:
+        main = cfg.get("main", {})
+        if "size" in main:
+            self.w, self.h = main["size"]
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def set_controls(self, controls) -> None:
+        return None
+
+    def capture_array(self, stream_name="main"):
+        self.frame_idx += 1
+        img = np.full((self.h, self.w, 3), DRY_RUN_BG, dtype=np.uint8)
+        cal_mode = auto_cal_active or calibrating
+
+        if not cal_mode:
+            # hareketli küçük koyu hedef
+            x = int((self.frame_idx * 9) % max(self.w - 40, 1)) + 20
+            y = int(self.h * 0.35 + 80 * math.sin(self.frame_idx * 0.08))
+            cv2.circle(img, (x, y), 5, (20, 20, 20), -1)
+
+            # ikinci hedef arada sahneye girsin
+            if (self.frame_idx // 90) % 2 == 1:
+                x2 = int(self.w * 0.75 + 60 * math.cos(self.frame_idx * 0.05))
+                y2 = int(self.h * 0.60 + 45 * math.sin(self.frame_idx * 0.11))
+                cv2.circle(img, (x2, y2), 4, (30, 30, 30), -1)
+
+            # nadiren büyük motion bloğu üret, suppression akışını egzersiz etsin
+            if (self.frame_idx // 150) % 3 == 2:
+                bx = int(self.w * 0.1)
+                by = int(self.h * 0.15)
+                cv2.rectangle(img, (bx, by), (bx + 180, by + 140), (120, 120, 120), -1)
+
+        # dry-run kalibrasyon için sentetik lazer noktası
+        if cal_mode and sim_laser_on:
+            with data_lock:
+                pan = target_pan_deg
+                tilt = target_tilt_deg
+            px = int(((pan - PAN_MIN_DEG) / max(PAN_MAX_DEG - PAN_MIN_DEG, 1e-6)) * (self.w - 120) + 60)
+            py = int(((tilt - TILT_MIN_DEG) / max(TILT_MAX_DEG - TILT_MIN_DEG, 1e-6)) * (self.h - 120) + 60)
+            px = max(8, min(self.w - 9, px))
+            py = max(8, min(self.h - 9, py))
+            cv2.circle(img, (px, py), 4, (40, 40, 255), -1)
+
+        # OpenCV sonrası kod RGB bekliyor
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+def pan_to_servo_val(deg: float) -> float:
+    """Pan fiziksel açısı (0°=merkez) → gpiozero -1.0..1.0 (manual-control5.py ile aynı)"""
+    return deg / 90.0
+
+def tilt_to_servo_val(deg: float) -> float:
+    """Tilt gösterge açısı (0°=alt limit) → gpiozero -1.0..1.0; TILT_ZERO_OFFSET uygulanır"""
+    return ((deg + TILT_ZERO_OFFSET) / 90.0) - 1.0
 
 def adaptive_kp(error_px: float) -> float:
     t = min(abs(error_px) / KP_BOOST_ERROR_PX, 1.0)
@@ -326,7 +703,7 @@ class Track:
 
     def kalman_predict(self) -> tuple[float, float]:
         pred = self.kf.predict()
-        return (float(pred[0]), float(pred[1]))
+        return (float(pred[0, 0]), float(pred[1, 0]))
 
     def predict(self) -> tuple[float, float]:
         return (self._pred_cx, self._pred_cy)
@@ -398,10 +775,10 @@ class Tracker:
             tr = self.tracks[tid]
             meas = np.array([[float(d.cx)], [float(d.cy)]], dtype=np.float32)
             corrected = tr.kf.correct(meas)
-            tr.cx = float(corrected[0])
-            tr.cy = float(corrected[1])
-            tr.vx = float(corrected[2])
-            tr.vy = float(corrected[3])
+            tr.cx = float(corrected[0, 0])
+            tr.cy = float(corrected[1, 0])
+            tr.vx = float(corrected[2, 0])
+            tr.vy = float(corrected[3, 0])
             tr.hits += 1
             tr.age += 1
             tr.misses = 0
@@ -427,8 +804,8 @@ class Tracker:
             tr.age += 1
             tr.cx = tr._pred_cx
             tr.cy = tr._pred_cy
-            tr.vx = float(tr.kf.statePost[2])
-            tr.vy = float(tr.kf.statePost[3])
+            tr.vx = float(tr.kf.statePost[2, 0])
+            tr.vy = float(tr.kf.statePost[3, 0])
             if tr.misses > MAX_MISSED:
                 expired.append(tid)
         for tid in expired:
@@ -676,10 +1053,22 @@ input[type=number]{background:#1a1a1a;color:#ddd;border:1px solid #333;padding:6
 """ + _NAV + """
 <div class="content">
 
-<div class="card">
-  <h3>Nasıl Yapılır?</h3>
+<div class="card" style="border-color:#1a4a1a">
+  <h3>⚡ Otomatik Kalibrasyon (Önerilen)</h3>
   <div class="steps">
-    1. Kalibrasyonu Başlat → servolar merkeze gider, lazer açılır<br>
+    Sistem servoları otomatik gezdirir, <b>kırmızı lazer noktasını kendisi bulur</b> ve
+    piksel→servo haritasını çıkarır. Tek yapman gereken:<br>
+    1. Lazerin vurduğu bölgeye düz bir yüzey (duvar/karton) koy — tarama menzilini görsün<br>
+    2. Aşağıdaki butona bas, stream'de yeşil noktalar birikirken bekle (~20 sn)
+  </div>
+  <button class="btn btn-ok" style="margin-top:10px" onclick="startAutoCalib()">⚡ Otomatik Kalibrasyonu Başlat</button>
+  <div id="auto-status" style="margin-top:10px;font-size:13px;color:#7ab">Hazır.</div>
+</div>
+
+<div class="card">
+  <h3>Manuel Kalibrasyon (alternatif)</h3>
+  <div class="steps">
+    1. Kalibrasyonu Başlat → otomatik kalibrasyon varsa durur, sistem home konumuna gider, lazer açılır<br>
     2. Hedefi <b>~150 cm</b> mesafeye koy (kağıt yüzeye lazer noktasını düşür)<br>
     3. Aşağıdaki stream'de <b>lazer noktasının tam merkezine</b> tıkla<br>
     4. Mesafeyi gir → Onayla ve Kaydet
@@ -718,7 +1107,7 @@ let clickX=null,clickY=null
 
 function startCalib(){
   fetch('/calibrate/start',{method:'POST'}).then(r=>r.json()).then(()=>{
-    document.getElementById('info').textContent='Lazer açık. Stream\'de lazer noktasına tıklayın.'
+    document.getElementById('info').textContent="Lazer açık. Sistem home konumunda; stream'de lazer noktasına tıklayın."
     refreshStatus()
   })
 }
@@ -749,112 +1138,27 @@ function cancelCalib(){
     clickX=null;clickY=null;refreshStatus()
   })
 }
+function startAutoCalib(){
+  document.getElementById('auto-status').textContent='Başlatılıyor… servolar hareket edecek, bekleyin.'
+  fetch('/calibrate/auto',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.status==='already_running')
+      document.getElementById('auto-status').textContent='Zaten çalışıyor…'
+    refreshStatus()
+  })
+}
 function refreshStatus(){
   fetch('/calibrate/status').then(r=>r.json()).then(d=>{
     const ox=(d.laser_offset_px_x||0).toFixed(2),oy=(d.laser_offset_px_y||0).toFixed(2)
-    document.getElementById('cal-status').textContent=d.has_calibration_file
-      ?'offset_px  : ('+ox+', '+oy+')\ncalibrating: '+d.calibrating
-      :'Kalibrasyon dosyası yok — offset=(0,0)'
-  })
+    document.getElementById('cal-status').innerHTML=
+      (d.has_pixel_map?'✓ Piksel→servo haritası AKTİF':'Piksel haritası yok')
+      +'<br>'+(d.has_calibration_file?'dosya: var':'dosya: yok')
+      +'<br>offset_px: ('+ox+', '+oy+')'
+    const a=document.getElementById('auto-status')
+    if(d.auto_cal_active) a.textContent='⏳ '+(d.auto_cal_status||'çalışıyor…')
+    else if(d.auto_cal_status) a.textContent=d.auto_cal_status
+  }).catch(()=>{})
 }
-refreshStatus();setInterval(refreshStatus,3000)
-
-<div id="steps">
-  1. "Kalibrasyonu Başlat"a tıkla — servolar merkeze gider, lazer açılır<br>
-  2. Hedefi <b>~150 cm</b> mesafeye koy (kağıt yüzeye lazer noktasını düşür)<br>
-  3. Aşağıdaki stream'de <b>lazer noktasının tam merkezine</b> tıkla<br>
-  4. Mesafeyi gir ve "Onayla ve Kaydet"e bas
-</div>
-
-<div>
-  <button class="ok" onclick="startCalib()">Kalibrasyonu Başlat</button>
-  <button class="danger" onclick="cancelCalib()">İptal</button>
-</div>
-
-<div id="canvas-wrap">
-  <img id="stream" src="/stream.mjpg" onclick="onStreamClick(event)"/>
-  <div id="marker"></div>
-</div>
-
-<div id="info">Henüz tıklanmadı.</div>
-
-<div style="margin-top:12px">
-  Kalibrasyon mesafesi (cm):
-  <input id="dist" type="number" value="150" min="30" max="500">
-  <button class="ok" onclick="doConfirm()">Onayla ve Kaydet</button>
-</div>
-
-<div id="status"></div>
-
-<script>
-let clickX = null, clickY = null;
-
-function startCalib() {
-  fetch('/calibrate/start', {method:'POST'}).then(r=>r.json()).then(d=>{
-    document.getElementById('info').textContent =
-      'Kalibrasyon modu aktif — lazer açık. Stream üzerinde lazer noktasına tıklayın.';
-    refreshStatus();
-  });
-}
-
-function onStreamClick(e) {
-  const img = document.getElementById('stream');
-  const rect = img.getBoundingClientRect();
-  const scaleX = img.naturalWidth / rect.width;
-  const scaleY = img.naturalHeight / rect.height;
-  clickX = Math.round((e.clientX - rect.left) * scaleX);
-  clickY = Math.round((e.clientY - rect.top)  * scaleY);
-
-  const marker = document.getElementById('marker');
-  marker.style.left = (e.clientX - rect.left) + 'px';
-  marker.style.top  = (e.clientY - rect.top)  + 'px';
-  marker.style.display = 'block';
-
-  document.getElementById('info').textContent =
-    'Seçilen: (' + clickX + ', ' + clickY + ') px. Onayla ya da farklı bir noktaya tıkla.';
-
-  fetch('/calibrate/click', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({x: clickX, y: clickY})
-  });
-}
-
-function doConfirm() {
-  if (clickX === null) { alert('Önce lazer noktasına tıklayın.'); return; }
-  const dist = parseInt(document.getElementById('dist').value) || 150;
-  fetch('/calibrate/confirm', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({distance_cm: dist})
-  }).then(r=>r.json()).then(d=>{
-    if (d.status === 'error') {
-      document.getElementById('info').textContent = 'Hata: ' + d.msg;
-    } else {
-      document.getElementById('info').textContent =
-        'Kaydedildi! offset=(' + d.offset_px_x + ', ' + d.offset_px_y + ')px @ ' + d.distance_cm + 'cm';
-    }
-    refreshStatus();
-  });
-}
-
-function cancelCalib() {
-  fetch('/calibrate/cancel', {method:'POST'}).then(r=>r.json()).then(()=>{
-    document.getElementById('info').textContent = 'İptal edildi.';
-    document.getElementById('marker').style.display = 'none';
-    clickX = null; clickY = null;
-    refreshStatus();
-  });
-}
-
-function refreshStatus() {
-  fetch('/calibrate/status').then(r=>r.json()).then(d=>{
-    document.getElementById('status').textContent = JSON.stringify(d, null, 2);
-  });
-}
-
-refreshStatus();
-setInterval(refreshStatus, 3000);
+refreshStatus();setInterval(refreshStatus,1000)
 </script></body></html>"""
 
 
@@ -924,6 +1228,9 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                     "laser_offset_px_y":  LASER_OFFSET_PX_Y,
                     "calibrating":        calibrating,
                     "has_calibration_file": os.path.exists(CALIB_PATH),
+                    "has_pixel_map":      HAS_PIXEL_MAP,
+                    "auto_cal_active":    auto_cal_active,
+                    "auto_cal_status":    auto_cal_status,
                 })
             else:
                 self.send_error(404)
@@ -931,18 +1238,26 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
         def do_POST(self):
             global calibrating, calib_click_px, current_target_id, killed_flies
             global LASER_OFFSET_PX_X, LASER_OFFSET_PX_Y
+            global auto_cal_active, auto_cal_status
+            global target_pan_deg, target_tilt_deg
+            global sim_laser_on
 
             if self.path == "/laser/off":
                 with data_lock:
                     current_target_id = None
-                    target_pan_deg    = 90.0
-                    target_tilt_deg   = 90.0
+                    target_pan_deg    = PAN_HOME_DEG
+                    target_tilt_deg   = TILT_HOME_DEG
+                    sim_laser_on      = False
                 if HAS_GPIO and lazer:
                     lazer.off()
                 log("[WEB] Lazer zorla kapatıldı.")
                 self._json_ok({"status": "laser_off"})
 
             elif self.path == "/laser/on":
+                if calibrating or auto_cal_active:
+                    self._json_ok({"status": "error", "msg": "Kalibrasyon sırasında manuel lazer açılamaz"})
+                    return
+                sim_laser_on = True
                 if HAS_GPIO and lazer:
                     lazer.on()
                 log("[WEB] Lazer manuel açıldı (test — state machine override edebilir).")
@@ -956,18 +1271,27 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 self._json_ok({"status": "reset"})
 
             elif self.path == "/calibrate/start":
+                if auto_cal_active:
+                    self._json_ok({"status": "error", "msg": "Önce otomatik kalibrasyonu iptal et"})
+                    return
                 with data_lock:
+                    auto_cal_active   = False
+                    auto_cal_status   = ""
                     calibrating       = True
                     calib_click_px    = None
                     current_target_id = None
-                    target_pan_deg    = 90.0
-                    target_tilt_deg   = 90.0
+                    target_pan_deg    = PAN_HOME_DEG
+                    target_tilt_deg   = TILT_HOME_DEG
+                    sim_laser_on      = True
                 if HAS_GPIO and lazer:
                     lazer.on()
                 log("[KALİBRASYON] Kalibrasyon modu başlatıldı.")
                 self._json_ok({"status": "calibrating"})
 
             elif self.path == "/calibrate/click":
+                if not calibrating or auto_cal_active:
+                    self._json_ok({"status": "error", "msg": "Manuel kalibrasyon aktif değil"})
+                    return
                 length = int(self.headers.get("Content-Length", 0))
                 body   = _json.loads(self.rfile.read(length))
                 with data_lock:
@@ -975,12 +1299,16 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 self._json_ok({"status": "click_received", "x": body["x"], "y": body["y"]})
 
             elif self.path == "/calibrate/confirm":
+                if not calibrating or auto_cal_active:
+                    self._json_ok({"status": "error", "msg": "Onay için manuel kalibrasyon aktif olmalı"})
+                    return
                 length = int(self.headers.get("Content-Length", 0))
                 body   = _json.loads(self.rfile.read(length)) if length else {}
                 distance_cm = int(body.get("distance_cm", 150))
                 with data_lock:
                     click       = calib_click_px
                     calibrating = False
+                    sim_laser_on = False
                 if HAS_GPIO and lazer:
                     lazer.off()
                 if click is None:
@@ -1002,12 +1330,35 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
 
             elif self.path == "/calibrate/cancel":
                 with data_lock:
-                    calibrating    = False
-                    calib_click_px = None
+                    calibrating     = False
+                    calib_click_px  = None
+                    auto_cal_active = False
+                    target_pan_deg  = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                    sim_laser_on    = False
                 if HAS_GPIO and lazer:
                     lazer.off()
                 log("[KALİBRASYON] İptal edildi.")
                 self._json_ok({"status": "cancelled"})
+
+            elif self.path == "/calibrate/auto":
+                if calibrating:
+                    self._json_ok({"status": "error", "msg": "Önce manuel kalibrasyonu iptal et"})
+                    return
+                if auto_cal_active:
+                    self._json_ok({"status": "already_running"})
+                    return
+                with data_lock:
+                    calibrating       = False   # manuel mod ile çakışmasın
+                    calib_click_px    = None
+                    current_target_id = None
+                    target_pan_deg    = PAN_HOME_DEG
+                    target_tilt_deg   = TILT_HOME_DEG
+                    auto_cal_active   = True
+                    auto_cal_status   = "Başlatılıyor…"
+                    sim_laser_on      = False
+                log("[OTO-KALİBRASYON] Web'den başlatıldı.")
+                self._json_ok({"status": "auto_calibrating"})
 
             else:
                 self.send_error(404)
@@ -1027,6 +1378,17 @@ def start_stream(buf_main: FrameBuffer, buf_debug: FrameBuffer, port: int):
     return httpd
 
 
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Mosquito laser turret runtime")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Picamera2/gpio olmadan sentetik kamera ile çalış")
+    p.add_argument("--no-stream", action="store_true",
+                   help="HTTP MJPEG server başlatma")
+    p.add_argument("--stream-port", type=int, default=STREAM_PORT,
+                   help="MJPEG HTTP portu")
+    return p
+
+
 # =========================================================================
 # THREAD: MOTORLARIN PÜRÜZSÜZ LERP SÜZÜLME DÖNGÜSÜ
 # =========================================================================
@@ -1043,13 +1405,19 @@ def motor_smooth_thread():
         with data_lock:
             t_pan = target_pan_deg
             t_tilt = target_tilt_deg
+
+        if not HAS_GPIO or pan_servo is None or tilt_servo is None:
+            current_pan_deg = max(PAN_MIN_DEG, min(PAN_MAX_DEG, t_pan))
+            current_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG, t_tilt))
+            time.sleep(0.005)
+            continue
             
         # PAN Süzülme Kontrolü
         pan_diff = t_pan - current_pan_deg
         if abs(pan_diff) > 0.05:
             current_pan_deg += pan_diff * smooth_factor
             current_pan_deg = max(PAN_MIN_DEG, min(PAN_MAX_DEG, current_pan_deg))
-            pan_servo.value = deg_to_servo_val(current_pan_deg)
+            pan_servo.value = pan_to_servo_val(current_pan_deg)
             pan_active = True
         elif pan_active:
             pan_servo.detach()  # Hedefe milimetrik oturduğunda enerjiyi kes, titremesin
@@ -1060,7 +1428,7 @@ def motor_smooth_thread():
         if abs(tilt_diff) > 0.05:
             current_tilt_deg += tilt_diff * smooth_factor
             current_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG, current_tilt_deg))
-            tilt_servo.value = deg_to_servo_val(current_tilt_deg)
+            tilt_servo.value = tilt_to_servo_val(current_tilt_deg)
             tilt_active = True
         elif tilt_active:
             tilt_servo.detach()
@@ -1073,39 +1441,51 @@ def motor_smooth_thread():
 # Main
 # =========================================================================
 
-def main() -> None:
+def main(argv=None) -> None:
     global current_target_id, lock_start_time, target_pan_deg, target_tilt_deg, is_running
     global pan_servo, tilt_servo, lazer
+    global auto_cal_active, auto_cal_status
+    global sim_laser_on
+    global STREAM_PORT
+
+    args = build_parser().parse_args(argv)
+    dry_run = bool(args.dry_run)
+    STREAM_PORT = int(args.stream_port)
+    enable_stream = ENABLE_STREAM and not args.no_stream
 
     _load_calibration()
 
     # Donanım Başlatma Kontrolleri
-    trigger = LED(TRIGGER_PIN) if HAS_GPIO else None
+    trigger = LED(TRIGGER_PIN) if HAS_GPIO and not dry_run else None
     
-    if HAS_GPIO:
-        # MG90S için datasheet'te doğrulanmış 1-2 ms pulse aralıkları [cite: 29]
-        min_pw = 0.001
-        max_pw = 0.002
-        
-        pan_servo = Servo(PAN_PIN, min_pulse_width=min_pw, max_pulse_width=max_pw)
-        tilt_servo = Servo(TILT_PIN, min_pulse_width=min_pw, max_pulse_width=max_pw)
+    if HAS_GPIO and not dry_run:
+        # Klon MG90S için 0.5–2.5 ms geniş pulse aralığı (servo-angle-finder.py ile doğrulandı)
+        pan_servo = Servo(PAN_PIN, min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW)
+        tilt_servo = Servo(TILT_PIN, min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW)
         lazer = LED(LAZER_PIN)
-        
-        # İlk kalibrasyon: Merkeze al ve enerjiyi geçici olarak kes
-        pan_servo.value = deg_to_servo_val(90)
-        tilt_servo.value = deg_to_servo_val(90)
+
+        # İlk konum: pan merkez (0°), tilt alt limit (0°); sonra enerjiyi geçici olarak kes
+        pan_servo.value = pan_to_servo_val(PAN_HOME_DEG)
+        tilt_servo.value = tilt_to_servo_val(TILT_HOME_DEG)
         time.sleep(0.3)
         pan_servo.detach()
         tilt_servo.detach()
         log("Servolar ve Lazer başarıyla ilklendirildi.")
     else:
-        log("UYARI: gpiozero kütüphanesi yüklenemedi, donanım kontrolü simüle edilecek.")
+        reason = "dry-run aktif" if dry_run else "gpiozero kütüphanesi yüklenemedi"
+        log(f"UYARI: {reason}, donanım kontrolü simüle edilecek.")
 
     # Bağımsız Motor Kontrol Thread'ini Başlatıyoruz
     t_motor = threading.Thread(target=motor_smooth_thread)
     t_motor.start()
 
-    picam2 = Picamera2()
+    if dry_run:
+        picam2 = SyntheticCamera()
+        log("Dry-run: sentetik kamera etkin.")
+    else:
+        if not HAS_PICAMERA2:
+            raise RuntimeError("Picamera2 kullanılamıyor. Dry-run için --dry-run kullan.")
+        picam2 = Picamera2()
     cam_controls = {"FrameRate": TARGET_FPS}
     if EXPOSURE_TIME_US > 0:
         cam_controls["AeEnable"] = False
@@ -1125,7 +1505,15 @@ def main() -> None:
 
     buf_main = FrameBuffer()
     buf_debug = FrameBuffer()
-    httpd = start_stream(buf_main, buf_debug, STREAM_PORT) if ENABLE_STREAM else None
+    httpd = None
+    if enable_stream:
+        try:
+            httpd = start_stream(buf_main, buf_debug, STREAM_PORT)
+        except OSError as e:
+            if dry_run:
+                log(f"UYARI: stream başlatılamadı ({e}). Dry-run stream'siz devam ediyor.")
+            else:
+                raise
 
     pipeline = MaskPipeline()
     tracker = Tracker()
@@ -1136,7 +1524,12 @@ def main() -> None:
     max_motion_px = int(MAX_GLOBAL_MOTION_RATIO * PROCESS_W * PROCESS_H)
 
     frame_idx = 0
+    exposure_settle = 0          # >0 ise pozlama yeni değişti, frame-diff'i bu kadar frame susturmak için
+    auto_cal = None              # AutoCalibrator instance (aktifken)
     last_trigger = 0.0
+    lock_visible_time = 0.0      # kilitli hedef frame'de gerçekten görülürken biriken süre
+    last_loop_time = time.time()
+    last_lock_log = 0.0
     fps = 0.0
     _fps_window = 60
     _frame_times: deque = deque(maxlen=_fps_window + 1)
@@ -1147,15 +1540,84 @@ def main() -> None:
 
     try:
         while True:
+            loop_now = time.time()
+            dt = max(0.0, loop_now - last_loop_time)
+            last_loop_time = loop_now
+
             rgb = picam2.capture_array("main")
             frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             small = cv2.resize(frame, (PROCESS_W, PROCESS_H),
                                interpolation=cv2.INTER_AREA)
             gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
+            # B2: Pozlama yeni değiştiyse görüntü parlaklığı zıplar — bu frame'lerde
+            # frame-diff'i sıfırla ki tüm-frame parlaklık sıçraması sahte motion üretmesin.
+            if exposure_settle > 0:
+                pipeline.prev_blur = None
+                exposure_settle -= 1
+
             enhanced, motion, motion_exclude, blackhat, combined = pipeline.process(gray)
 
             if frame_idx < WARMUP_FRAMES:
+                frame_idx += 1
+                continue
+
+            # İptal/bitiş sonrası bayat instance kalmasın — sonraki başlatma temiz olsun
+            if not auto_cal_active and auto_cal is not None:
+                auto_cal = None
+
+            # OTOMATİK KALİBRASYON MODU — servoları gezdirip lazer noktasıyla harita fit eder
+            if auto_cal_active:
+                if auto_cal is None:
+                    auto_cal = AutoCalibrator()
+                    log("[OTO-KALİBRASYON] Başladı.")
+                cmd = auto_cal.update(small)
+
+                if "pan" in cmd:
+                    with data_lock:
+                        target_pan_deg  = cmd["pan"]
+                        target_tilt_deg = cmd["tilt"]
+                        sim_laser_on    = bool(cmd.get("laser"))
+                if HAS_GPIO and lazer:
+                    lazer.on() if cmd.get("laser") else lazer.off()
+
+                if enable_stream:
+                    overlay = frame.copy()
+                    dot = auto_cal.last_dot or _detect_laser_dot(small, auto_cal.ref)
+                    if dot is not None:
+                        cv2.drawMarker(overlay, (int(dot[0] * sx), int(dot[1] * sy)),
+                                       (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
+                    for (px, py, _a) in auto_cal.dot_samples:
+                        cv2.circle(overlay, (int(px * sx), int(py * sy)), 2, (0, 180, 255), -1)
+                    for (_p, _t, px, py) in auto_cal.samples:
+                        cv2.circle(overlay, (int(px * sx), int(py * sy)), 3, (0, 255, 0), -1)
+                    cv2.putText(overlay, "OTO-KALIBRASYON: " + cmd["status"], (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+                    ok, jpg = cv2.imencode(".jpg", overlay, encode)
+                    if ok:
+                        buf_main.update(jpg.tobytes())
+
+                if cmd.get("done"):
+                    res = cmd.get("result")
+                    usable, reason = _is_pixel_map_usable(res)
+                    if usable:
+                        _save_pixel_map(res)
+                        auto_cal_status = (f"Tamamlandı — {res['n_samples']} nokta, "
+                                           f"rms {res['rms_pan_deg']}/{res['rms_tilt_deg']}°")
+                    else:
+                        auto_cal_status = f"BAŞARISIZ — {reason}"
+                        log(f"[OTO-KALİBRASYON] Başarısız: {reason}.")
+                    auto_cal_active = False
+                    auto_cal = None
+                    sim_laser_on = False
+                    if HAS_GPIO and lazer:
+                        lazer.off()
+                    with data_lock:
+                        target_pan_deg  = PAN_HOME_DEG
+                        target_tilt_deg = TILT_HOME_DEG
+                else:
+                    auto_cal_status = cmd["status"]
+
                 frame_idx += 1
                 continue
 
@@ -1173,7 +1635,7 @@ def main() -> None:
                 if click is not None:
                     cv2.drawMarker(overlay, (int(click[0]), int(click[1])),
                                    (0, 0, 255), cv2.MARKER_TILTED_CROSS, 30, 2)
-                if ENABLE_STREAM:
+                if enable_stream:
                     ok, jpg = cv2.imencode(".jpg", overlay, encode)
                     if ok:
                         buf_main.update(jpg.tobytes())
@@ -1257,7 +1719,9 @@ def main() -> None:
                     dets = []
 
             if suppressed:
-                tracker.tracks.clear()
+                # Track'leri silme — Kalman ile coast et, MAX_MISSED dolunca kendiliğinden düşer.
+                # Böylece tek frame'lik gürültü (el geçişi, ışık titremesi) kilidi yok etmez.
+                tracker.update([], frame_idx)
                 n_suppressed += 1
             else:
                 if exclusion_zones:
@@ -1275,69 +1739,97 @@ def main() -> None:
             active_tracks = [tr for tr in tracker.tracks.values() if tr.misses == 0]
             now = time.time()
             target_still_visible = False
+            aim_error_x = None
+            aim_error_y = None
+            target_misses = None
 
-            # ADIM 1: Eğer halihazırda kilitli bir hedefimiz varsa onu takip et
+            # ADIM 1: Eğer halihazırda kilitli bir hedefimiz varsa onu takip et.
+            # Track coast ediyor olsa bile (misses>0, henüz MAX_MISSED'a ulaşmadı)
+            # Kalman tahminiyle takibe devam et — kısa suppression kilidi öldürmez.
             if current_target_id is not None:
-                for tr in active_tracks:
-                    if tr.track_id == current_target_id:
-                        target_still_visible = True
-                        gecen_sure = now - lock_start_time
+                tr = tracker.tracks.get(current_target_id)
+                if tr is not None:
+                    target_still_visible = True
+                    target_misses = tr.misses
+                    if tr.misses == 0:
+                        lock_visible_time += dt
 
-                        if gecen_sure >= 3.0:
-                            # 3 saniye kesintisiz vurduk, sinek imha edildi!
-                            if HAS_GPIO:
-                                lazer.off()
-                            killed_flies.add(tr.track_id)
-                            log(f"[İMHA EDİLDİ] ID: {tr.track_id} 3 saniye boyunca vuruldu. Kilit açıldı.")
-                            current_target_id = None
-                            with data_lock:
-                                target_pan_deg  = 90.0
-                                target_tilt_deg = 90.0
-                            if HAS_GPIO:
-                                pan_servo.detach()
-                                tilt_servo.detach()
-                        else:
-                            # 3 saniye henüz dolmadı, sineği pürüzsüzce merkeze doğru takip et
-                            error_x = tr.cx - (PROCESS_W / 2 + LASER_OFFSET_PX_X)
-                            error_y = tr.cy - (PROCESS_H / 2 + LASER_OFFSET_PX_Y)
+                    if lock_visible_time >= 3.0:
+                        # 3 saniye kesintisiz vurduk, sinek imha edildi!
+                        if HAS_GPIO and lazer:
+                            lazer.off()
+                        sim_laser_on = False
+                        killed_flies.add(tr.track_id)
+                        log(f"[İMHA EDİLDİ] ID: {tr.track_id} 3 saniye boyunca vuruldu. Kilit açıldı.")
+                        current_target_id = None
+                        lock_visible_time = 0.0
+                        with data_lock:
+                            target_pan_deg  = PAN_HOME_DEG
+                            target_tilt_deg = TILT_HOME_DEG
+                        if HAS_GPIO and pan_servo and tilt_servo:
+                            pan_servo.detach()
+                            tilt_servo.detach()
+                    elif tr.misses == 0 and HAS_PIXEL_MAP:
+                        # Doğru yöntem (sabit kamera): piksel→servo haritasıyla doğrudan nişan al.
+                        # Lazeri sineğin pikseline götürecek mutlak açıyı hesapla.
+                        aim_error_x = float(tr.cx - PROCESS_W / 2)
+                        aim_error_y = float(tr.cy - PROCESS_H / 2)
+                        want_pan, want_tilt = pixel_to_servo(tr.cx, tr.cy)
+                        with data_lock:
+                            target_pan_deg  = max(PAN_MIN_DEG,  min(PAN_MAX_DEG,  want_pan))
+                            target_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG, want_tilt))
+                    elif tr.misses == 0:
+                        # Harita yoksa eski oransal mod (sabit kamerada geometrik olarak hatalı,
+                        # sadece geriye dönük uyumluluk için — otomatik kalibrasyon önerilir).
+                        error_x = tr.cx - (PROCESS_W / 2 + LASER_OFFSET_PX_X)
+                        error_y = tr.cy - (PROCESS_H / 2 + LASER_OFFSET_PX_Y)
+                        aim_error_x = float(error_x)
+                        aim_error_y = float(error_y)
+                        kp_x = adaptive_kp(error_x)
+                        kp_y = adaptive_kp(error_y)
+                        with data_lock:
+                            target_pan_deg  = max(PAN_MIN_DEG,  min(PAN_MAX_DEG,
+                                                  target_pan_deg  - (error_x * kp_x)))
+                            target_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG,
+                                                  target_tilt_deg - (error_y * kp_y)))
 
-                            # Adaptif kazanım: hata büyükse KP_BOOST, küçükse KP_BASE
-                            kp_x = adaptive_kp(error_x)
-                            kp_y = adaptive_kp(error_y)
-
-                            with data_lock:
-                                target_pan_deg  = max(PAN_MIN_DEG,  min(PAN_MAX_DEG,
-                                                      target_pan_deg  - (error_x * kp_x)))
-                                target_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG,
-                                                      target_tilt_deg - (error_y * kp_y)))
-                        break
+                    if tr.misses == 0 and now - last_lock_log >= 1.0:
+                        last_lock_log = now
+                        if aim_error_x is not None and aim_error_y is not None:
+                            log(f"[LOCK] id={tr.track_id} vis={lock_visible_time:.1f}s "
+                                f"err=({aim_error_x:.1f},{aim_error_y:.1f})px "
+                                f"mode={'map' if HAS_PIXEL_MAP else 'offset'}")
 
             # ADIM 2: Eğer kilitli sinek gerçekten kadrajdan çıktıysa kilidi temizle
             if current_target_id is not None and not target_still_visible:
-                if HAS_GPIO:
+                if HAS_GPIO and lazer and pan_servo and tilt_servo:
                     lazer.off()
                     pan_servo.detach()
                     tilt_servo.detach()
+                sim_laser_on = False
                 log(f"[HEDEF KAÇTI] ID {current_target_id} gözden kayboldu. Lazer Kapatıldı.")
                 current_target_id = None
+                lock_visible_time = 0.0
                 with data_lock:
-                    target_pan_deg  = 90.0
-                    target_tilt_deg = 90.0
+                    target_pan_deg  = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
 
             # ADIM 3: Eğer sistem boştaysa ve yeni bir aday sinek geldiyse kilitlen
             if current_target_id is None:
                 candidates = [
-                    tr for tr in active_tracks
-                    if tr.track_id not in killed_flies and tr.hits >= MIN_HITS
+                    tr for tr in confirmed
+                    if tr.track_id not in killed_flies
                 ]
                 if candidates:
                     best = max(candidates, key=candidate_score)
                     best_score = candidate_score(best)
                     current_target_id = best.track_id
                     lock_start_time = now
+                    lock_visible_time = 0.0
                     target_still_visible = True  # Aynı frame içerisinde hedef kaçtı kontrolüne düşmemesi için
-                    if HAS_GPIO:
+                    if HAS_GPIO and lazer:
                         lazer.on()
+                    sim_laser_on = True
                     log(f"[KİLİTLENDİ] Hedef ID: {best.track_id} "
                         f"skor={best_score:.1f} hits={best.hits} "
                         f"path={best.path_length():.1f}px. Lazer AÇIK.")
@@ -1349,20 +1841,28 @@ def main() -> None:
                     "tracks":    len(tracker.tracks),
                     "confirmed": len(confirmed),
                     "laser":     bool(lazer.is_lit) if HAS_GPIO and lazer else False,
+                    "sim_laser": sim_laser_on,
                     "target_id": current_target_id,
                     "killed":    len(killed_flies),
                     "pan_deg":   round(current_pan_deg, 1),
                     "tilt_deg":  round(current_tilt_deg, 1),
                     "calibrating": calibrating,
+                    "auto_cal_active": auto_cal_active,
+                    "mode": "auto_cal" if auto_cal_active else ("manual_cal" if calibrating else "run"),
+                    "dry_run": dry_run,
+                    "suppressed": suppressed,
+                    "target_misses": target_misses,
+                    "lock_visible_s": round(lock_visible_time, 2),
+                    "aim_error_x": round(aim_error_x, 1) if aim_error_x is not None else None,
+                    "aim_error_y": round(aim_error_y, 1) if aim_error_y is not None else None,
+                    "aim_mode": "map" if HAS_PIXEL_MAP else "offset",
                 })
 
             # Orijinal röle tetikleyici mekanizması
             for tr in confirmed:
                 if not tr.triggered and (now - last_trigger) > TRIGGER_COOLDOWN:
                     if trigger is not None:
-                        trigger.on()
-                        time.sleep(0.05)
-                        trigger.off()
+                        pulse_output(trigger, 0.05)
                     last_trigger = now
                     tr.triggered = True
                     log(f"[DETECTION] id={tr.track_id} cx={tr.cx:.0f} cy={tr.cy:.0f} "
@@ -1387,7 +1887,7 @@ def main() -> None:
                 py = int(tr.cy * sy)
                 if tr.track_id == current_target_id:
                     color = (255, 0, 0) # Kilitli hedefe mavi çember çiz
-                    cv2.putText(frame, f"LASER LOCK {time.time()-lock_start_time:.1f}s", (px - 30, py - 20),
+                    cv2.putText(frame, f"LASER LOCK {lock_visible_time:.1f}s", (px - 30, py - 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2, cv2.LINE_AA)
                 else:
                     color = (0, 200, 200) if tr.hits < MIN_HITS else (0, 255, 0)
@@ -1433,7 +1933,7 @@ def main() -> None:
                 (200, 200, 200), 1, cv2.LINE_AA,
             )
 
-            if ENABLE_STREAM:
+            if enable_stream:
                 ok, jpg = cv2.imencode(".jpg", frame, encode)
                 if ok:
                     buf_main.update(jpg.tobytes())
@@ -1453,7 +1953,8 @@ def main() -> None:
                 elapsed = _frame_times[-1] - _frame_times[0]
                 fps = (len(_frame_times) - 1) / elapsed if elapsed > 0 else 0.0
             if frame_idx % BRIGHTNESS_WINDOW == 0 and frame_idx > WARMUP_FRAMES:
-                _adjust_exposure(picam2, float(np.mean(gray)))
+                if _adjust_exposure(picam2, float(np.mean(gray))):
+                    exposure_settle = 3   # kamera yeni pozlamaya oturana dek frame-diff sustur
             if frame_idx % 300 == 0:
                 log(f"FPS~{fps:.1f} trk:{len(tracker.tracks)} "
                     f"dets:{len(dets)} suppr_frames:{n_suppressed}")
@@ -1466,8 +1967,9 @@ def main() -> None:
         # =========================================================================
         is_running = False
         t_motor.join()
+        sim_laser_on = False
         
-        if HAS_GPIO:
+        if HAS_GPIO and lazer and pan_servo and tilt_servo:
             lazer.off()
             pan_servo.detach()
             tilt_servo.detach()

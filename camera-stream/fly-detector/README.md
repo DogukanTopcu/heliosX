@@ -1,6 +1,6 @@
 # Fly Detector
 
-This detector is tuned for moving dark dots on a mostly static wall.
+Bu klasör legacy detector akışıdır. Ana sistem artık `v2/new2.py` üzerinden ilerliyor. Buradaki araçlar izole detector denemeleri veya eski çalışma biçimini tekrar etmek için tutuluyor.
 
 ## Stream annotated output to a Mac or PC
 
@@ -37,3 +37,8 @@ cd ~/camera-stream/fly-detector
 - `--display-delay-ms`: only show a track after it survives this many milliseconds
 - `--mirror`: mirror the final preview and streamed output horizontally
 - `--debug-mask`: overlay the detection mask on the video
+
+## Scope note
+
+- Bu akış servo kontrolü, yeni kalibrasyon UI'si ve `v2` içindeki state machine davranışının kaynağı değildir.
+- Ana sistemle çelişki varsa `v2` dokümantasyonu esas alınır.

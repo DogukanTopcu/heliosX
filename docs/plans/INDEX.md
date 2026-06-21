@@ -3,6 +3,10 @@
 Bu dizin, mosquito laser turret projesinin geliştirme yol haritasını içerir.
 Her plan kendi `.md` dosyasında ayrıntılı olarak açıklanmıştır.
 
+## Not
+
+Bu klasör artık ağırlıklı olarak tarihsel tasarım kaydıdır. Gerçek mevcut davranış için önce `v2/new2.py`, ardından `docs/WORKFLOW.md`, `docs/TUNING.md` ve `docs/HARDWARE.md` okunmalıdır.
+
 ## Öncelik Sırası
 
 ### Kritik — Sistemi gerçekten çalıştırmak için şart
@@ -33,21 +37,14 @@ Her plan kendi `.md` dosyasında ayrıntılı olarak açıklanmıştır.
 
 ## Plan Bağımlılık Sırası
 
-```
-P1 → P11 → P8   (offset kodu → kalibrasyon akışı → web entegrasyonu)
-P2              (bağımsız)
-P3              (bağımsız)
-P4 → P7         (servo sınırları → adaptif gain)
-P1 + P4 → P7   (her ikisi de gerekli)
-P5              (bağımsız, P1-P4 stabil olduktan sonra)
-P6              (bağımsız)
-P9              (bağımsız, en karmaşık)
-P10             (bağımsız)
+```text
+P1 → P11 → P8
+P4 → P7
+P5, P6, P9, P10 bağımsız uygulanabilir
 ```
 
-## Uygulama Prensibi
+## Uygulama prensibi
 
-- Her planı implement etmeden önce ilgili `.md` dosyasını oku.
-- Bir adımı bitirdiğinde INDEX.md'deki durumu "Tamamlandı" olarak güncelle.
-- Her plan bağımsız şekilde uygulanabilir; sıranın önemi olmadığı durumlarda not edilmiştir.
-- Tüm değişiklikler `v2/new2.py` üzerinde yapılır — prototip dosyaları (`new.py`, `fly_detect.py`) dokunulmadan kalır.
+- Planlar karar geçmişi sağlar; kod ile çelişirse kod kazanır.
+- Yeni işte önce tarihsel plan değil mevcut runtime davranışı doğrulanır.
+- Tüm değişiklikler mümkünse `v2/new2.py` üzerinde toplanır.
