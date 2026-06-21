@@ -27,17 +27,6 @@ try:
 except Exception:
     HAS_GPIO = False
 
-# -------------------------------------------------------------
-# LOGGING VE SİSTEM AYARLARI
-# -------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO, 
-    format='[%(asctime)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-
-def log(msg: str) -> None:
-    logging.info(msg)
 
 # =========================================================================
 # AYARLAR (sahnene gore ayarla)
@@ -109,6 +98,12 @@ PAN_PIN = 12                          # Servo Pan (Sağ-Sol) GPIO pini
 TILT_PIN = 13                         # Servo Tilt (Yukarı-Aşağı) GPIO pini
 LAZER_PIN = 14                        # Lazer Modülü GPIO pini
 
+# Servo mekanik hareket sınırları — manual-control5.py ile fiziksel limitleri test edip ayarla
+PAN_MIN_DEG  = 30.0
+PAN_MAX_DEG  = 150.0
+TILT_MIN_DEG = 45.0
+TILT_MAX_DEG = 135.0
+
 # Stream / log
 ENABLE_STREAM = True
 STREAM_PORT = 8080
@@ -116,6 +111,29 @@ STREAM_QUALITY = 75
 WARMUP_FRAMES = 15                    # detection bu kadar frame sonra basla
 LOG_TO_FILE = True
 LOG_PATH = "/home/heliosx/v2/detections.log"
+
+# =========================================================================
+# LOGGING KURULUMU (sabitlerden sonra — LOG_TO_FILE ve LOG_PATH burada okunuyor)
+# =========================================================================
+import logging.handlers as _log_handlers
+
+_log_fmt = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+_logger = logging.getLogger("turret")
+_logger.setLevel(logging.INFO)
+
+_sh = logging.StreamHandler()
+_sh.setFormatter(_log_fmt)
+_logger.addHandler(_sh)
+
+if LOG_TO_FILE:
+    _fh = _log_handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _fh.setFormatter(_log_fmt)
+    _logger.addHandler(_fh)
+
+def log(msg: str) -> None:
+    _logger.info(msg)
 
 # =========================================================================
 # DONANIM VE MOTOR GLOBAL DEĞİŞKENLERİ
@@ -468,16 +486,18 @@ def motor_smooth_thread():
         pan_diff = t_pan - current_pan_deg
         if abs(pan_diff) > 0.05:
             current_pan_deg += pan_diff * smooth_factor
+            current_pan_deg = max(PAN_MIN_DEG, min(PAN_MAX_DEG, current_pan_deg))
             pan_servo.value = deg_to_servo_val(current_pan_deg)
             pan_active = True
         elif pan_active:
             pan_servo.detach()  # Hedefe milimetrik oturduğunda enerjiyi kes, titremesin
             pan_active = False
-            
+
         # TILT Süzülme Kontrolü
         tilt_diff = t_tilt - current_tilt_deg
         if abs(tilt_diff) > 0.05:
             current_tilt_deg += tilt_diff * smooth_factor
+            current_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG, current_tilt_deg))
             tilt_servo.value = deg_to_servo_val(current_tilt_deg)
             tilt_active = True
         elif tilt_active:
@@ -553,8 +573,9 @@ def main() -> None:
 
     frame_idx = 0
     last_trigger = 0.0
-    t0 = time.time()
     fps = 0.0
+    _fps_window = 60
+    _frame_times: deque = deque(maxlen=_fps_window + 1)
     n_suppressed = 0
     biggest_history: deque = deque(maxlen=TARGET_FPS)
     display_max = (0, 0, 0)
@@ -574,6 +595,7 @@ def main() -> None:
                 frame_idx += 1
                 continue
 
+            _frame_times.append(time.time())
             total_motion = int(cv2.countNonZero(motion))
             suppressed = total_motion > max_motion_px
 
@@ -683,7 +705,9 @@ def main() -> None:
                             killed_flies.add(tr.track_id)
                             log(f"[İMHA EDİLDİ] ID: {tr.track_id} 3 saniye boyunca vuruldu. Kilit açıldı.")
                             current_target_id = None
-                            
+                            with data_lock:
+                                target_pan_deg  = 90.0
+                                target_tilt_deg = 90.0
                             if HAS_GPIO:
                                 pan_servo.detach()
                                 tilt_servo.detach()
@@ -697,8 +721,10 @@ def main() -> None:
                             kp_y = 0.040
 
                             with data_lock:
-                                target_pan_deg = max(0.0, min(180.0, target_pan_deg - (error_x * kp_x)))
-                                target_tilt_deg = max(0.0, min(180.0, target_tilt_deg - (error_y * kp_y)))
+                                target_pan_deg  = max(PAN_MIN_DEG,  min(PAN_MAX_DEG,
+                                                      target_pan_deg  - (error_x * kp_x)))
+                                target_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG,
+                                                      target_tilt_deg - (error_y * kp_y)))
                         break
 
             # ADIM 2: Eğer kilitli sinek gerçekten kadrajdan çıktıysa kilidi temizle
@@ -709,6 +735,9 @@ def main() -> None:
                     tilt_servo.detach()
                 log(f"[HEDEF KAÇTI] ID {current_target_id} gözden kayboldu. Lazer Kapatıldı.")
                 current_target_id = None
+                with data_lock:
+                    target_pan_deg  = 90.0
+                    target_tilt_deg = 90.0
 
             # ADIM 3: Eğer sistem boştaysa ve yeni bir aday sinek geldiyse kilitlen
             if current_target_id is None:
@@ -731,6 +760,8 @@ def main() -> None:
                         trigger.off()
                     last_trigger = now
                     tr.triggered = True
+                    log(f"[DETECTION] id={tr.track_id} cx={tr.cx:.0f} cy={tr.cy:.0f} "
+                        f"hits={tr.hits} path={tr.path_length():.1f}px speed={tr.speed():.1f}px/f")
 
             # =========================================================================
             # Orijinal Çizim ve Görüntü Katmanı (Overlay)
@@ -809,8 +840,9 @@ def main() -> None:
                     buf_debug.update(jpg.tobytes())
 
             frame_idx += 1
-            if frame_idx % 30 == 0:
-                fps = frame_idx / (time.time() - t0)
+            if frame_idx % 30 == 0 and len(_frame_times) >= 2:
+                elapsed = _frame_times[-1] - _frame_times[0]
+                fps = (len(_frame_times) - 1) / elapsed if elapsed > 0 else 0.0
             if frame_idx % 300 == 0:
                 log(f"FPS~{fps:.1f} trk:{len(tracker.tracks)} "
                     f"dets:{len(dets)} suppr_frames:{n_suppressed}")

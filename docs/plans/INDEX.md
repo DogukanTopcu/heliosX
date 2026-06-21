@@ -10,9 +10,9 @@ Her plan kendi `.md` dosyasında ayrıntılı olarak açıklanmıştır.
 | # | Plan | Dosya | Durum |
 |---|---|---|---|
 | P1 | Lazer-Kamera Offset (kod değişikliği + config yükleme) | [P1-laser-offset.md](P1-laser-offset.md) | Bekliyor |
-| P2 | Log Dosyasına Yazma (Kod Var, Çalışmıyor) | [P2-log-fix.md](P2-log-fix.md) | Bekliyor |
-| P3 | FPS Hesabı Sliding Window ile Düzeltme | [P3-fps-fix.md](P3-fps-fix.md) | Bekliyor |
-| P4 | Servo Mekanik Güvenlik Sınırları | [P4-servo-limits.md](P4-servo-limits.md) | Bekliyor |
+| P2 | Log Dosyasına Yazma (Kod Var, Çalışmıyor) | [P2-log-fix.md](P2-log-fix.md) | Tamamlandı |
+| P3 | FPS Hesabı Sliding Window ile Düzeltme | [P3-fps-fix.md](P3-fps-fix.md) | Tamamlandı |
+| P4 | Servo Mekanik Güvenlik Sınırları | [P4-servo-limits.md](P4-servo-limits.md) | Tamamlandı |
 | P11 | Kalibrasyon Sistemi (interaktif, tekrarlanabilir, kalıcı) | [P11-calibration-system.md](P11-calibration-system.md) | Bekliyor |
 
 ### Orta Öncelik — Uzun vadeli kullanım için önemli
