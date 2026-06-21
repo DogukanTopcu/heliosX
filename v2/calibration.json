@@ -1,0 +1,9 @@
+{
+  "laser_offset_px_x": 131.0,
+  "laser_offset_px_y": -82.5,
+  "laser_offset_deg_x": 13.509,
+  "laser_offset_deg_y": -11.229,
+  "calibration_distance_cm": 150,
+  "calibrated_at": "2026-06-21T16:31:39",
+  "process_resolution": "640x360"
+}

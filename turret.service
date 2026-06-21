@@ -1,0 +1,17 @@
+[Unit]
+Description=Mosquito Laser Turret
+After=network.target
+
+[Service]
+Type=simple
+User=heliosx
+WorkingDirectory=/home/heliosx/v2
+ExecStart=/usr/bin/python3 /home/heliosx/v2/new2.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

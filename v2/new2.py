@@ -104,6 +104,16 @@ PAN_MAX_DEG  = 150.0
 TILT_MIN_DEG = 45.0
 TILT_MAX_DEG = 135.0
 
+# Lazer-Kamera fiziksel offset (piksel, 640×360 process çözünürlüğünde)
+# Pozitif X: lazer kamera merkezinin sağında; Pozitif Y: lazer kamera merkezinin altında
+# Kalibrasyon sonrası calibration.json'dan otomatik yüklenir, burayı manuel değiştirme
+LASER_OFFSET_PX_X = 0.0
+LASER_OFFSET_PX_Y = 0.0
+CALIB_PATH = "/home/heliosx/v2/calibration.json"
+# Camera Module 3, 1280×720 modunda yaklaşık FoV değerleri
+CAMERA_FOV_H_DEG = 66.0
+CAMERA_FOV_V_DEG = 49.0
+
 # Stream / log
 ENABLE_STREAM = True
 STREAM_PORT = 8080
@@ -135,6 +145,47 @@ if LOG_TO_FILE:
 def log(msg: str) -> None:
     _logger.info(msg)
 
+
+import json as _json
+import datetime as _dt
+
+
+def _load_calibration() -> None:
+    global LASER_OFFSET_PX_X, LASER_OFFSET_PX_Y
+    if not os.path.exists(CALIB_PATH):
+        log("Kalibrasyon dosyası yok, offset=(0,0) kullanılıyor.")
+        return
+    try:
+        with open(CALIB_PATH) as f:
+            data = _json.load(f)
+        LASER_OFFSET_PX_X = float(data.get("laser_offset_px_x", 0.0))
+        LASER_OFFSET_PX_Y = float(data.get("laser_offset_px_y", 0.0))
+        log(f"Kalibrasyon yüklendi: offset=({LASER_OFFSET_PX_X:.1f}, {LASER_OFFSET_PX_Y:.1f})px"
+            f" [{data.get('calibrated_at', '?')}]")
+    except Exception as e:
+        log(f"Kalibrasyon dosyası okunamadı: {e} — offset=(0,0) kullanılıyor.")
+
+
+def _save_calibration(offset_px_x: float, offset_px_y: float,
+                      distance_cm: int = 150) -> None:
+    deg_per_px_h = CAMERA_FOV_H_DEG / PROCESS_W
+    deg_per_px_v = CAMERA_FOV_V_DEG / PROCESS_H
+    data = {
+        "laser_offset_px_x":       round(offset_px_x, 2),
+        "laser_offset_px_y":       round(offset_px_y, 2),
+        "laser_offset_deg_x":      round(offset_px_x * deg_per_px_h, 3),
+        "laser_offset_deg_y":      round(offset_px_y * deg_per_px_v, 3),
+        "calibration_distance_cm": distance_cm,
+        "calibrated_at":           _dt.datetime.now().isoformat(timespec="seconds"),
+        "process_resolution":      f"{PROCESS_W}x{PROCESS_H}",
+    }
+    with open(CALIB_PATH, "w") as f:
+        _json.dump(data, f, indent=2)
+    log(f"[KALİBRASYON] Kaydedildi: offset=({offset_px_x:.1f}, {offset_px_y:.1f})px "
+        f"= ({data['laser_offset_deg_x']:.2f}°, {data['laser_offset_deg_y']:.2f}°) "
+        f"@ {distance_cm}cm")
+
+
 # =========================================================================
 # DONANIM VE MOTOR GLOBAL DEĞİŞKENLERİ
 # =========================================================================
@@ -151,6 +202,13 @@ current_tilt_deg = 90.0
 current_target_id = None    # Şu an kilitlenilen sineğin benzersiz ID'si
 lock_start_time = None      # Kilitlenme anının zaman damgası
 killed_flies = set()        # 3 saniye boyunca vurularak imha edilen sineklerin ID listesi
+
+# Kalibrasyon modu
+calibrating: bool = False
+calib_click_px: tuple[float, float] | None = None
+
+# Web handler'ların thread-safe okuyabileceği durum snapshot'ı
+web_status: dict = {}
 
 # Nesne tanımlayıcı placeholder'lar (Main içinde global olarak set edilecek)
 pan_servo = None
@@ -381,26 +439,337 @@ class FrameBuffer:
             self.cond.notify_all()
 
 
+_NAV = """
+<nav>
+  <span class="brand">🎯 Turret</span>
+  <a href="/control" id="nav-control">Kontrol</a>
+  <a href="/debug"   id="nav-debug">Debug Mask</a>
+  <a href="/calibrate" id="nav-cal">Kalibrasyon</a>
+</nav>"""
+
+_NAV_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d0d0d;color:#e0e0e0;font-family:system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
+nav{background:#161616;border-bottom:1px solid #2a2a2a;padding:10px 16px;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.brand{font-size:15px;font-weight:600;color:#fff;margin-right:auto}
+nav a{color:#888;text-decoration:none;padding:6px 12px;border-radius:5px;font-size:13px}
+nav a:hover{background:#2a2a2a;color:#fff}
+nav a.active{background:#252525;color:#5af}
+"""
+
 PAGE = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>v2 fly</title>
-<style>body{background:#111;color:#eee;font-family:system-ui;margin:0;padding:16px}
-img{max-width:100%;border:1px solid #333;border-radius:6px;margin-bottom:12px}
-.col{display:flex;flex-direction:column;gap:8px}.meta{font-size:12px;color:#888}
-a{color:#6cf}</style></head><body>
-<h2>v2 fly stream</h2>
-<div class="col">
-  <img src="/stream.mjpg"/>
-  <div class="meta">Yesil bbox: aday track. Kirmizi: trajectory onayli sinek (tetiklenen).
-  <a href="/debug">/debug</a> -> mask gorunumu</div>
-</div></body></html>"""
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Turret — Stream</title>
+<style>""" + _NAV_CSS + """
+.stream-wrap{flex:1;background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.stream-wrap img{max-width:100%;max-height:100%;object-fit:contain}
+</style></head><body>""" + _NAV + """
+<div class="stream-wrap"><img src="/stream.mjpg"/></div>
+<script>document.getElementById('nav-control').classList.add('active')</script>
+</body></html>"""
 
 DEBUG_PAGE = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>v2 debug</title>
-<style>body{background:#111;color:#eee;font-family:system-ui;margin:0;padding:16px}
-img{max-width:100%;border:1px solid #333;border-radius:6px}
-a{color:#6cf}</style></head><body>
-<h2>v2 debug mask</h2><img src="/debug.mjpg"/>
-<div><a href="/">geri</a></div></body></html>"""
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Turret — Debug</title>
+<style>""" + _NAV_CSS + """
+.content{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000;gap:10px}
+.content img{max-width:100%;max-height:calc(100% - 40px);object-fit:contain}
+.hint{font-size:12px;color:#555}
+</style></head><body>""" + _NAV + """
+<div class="content">
+  <img src="/debug.mjpg"/>
+  <p class="hint">Beyaz alan: deteksiyon pipeline birleşik maskesi (hareket + karanlık + adaptif)</p>
+</div>
+<script>document.getElementById('nav-debug').classList.add('active')</script>
+</body></html>"""
+
+CONTROL_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Turret — Kontrol</title>
+<style>
+""" + _NAV_CSS + """
+a{color:#5af;text-decoration:none}
+.layout{flex:1;display:flex;overflow:hidden}
+.stream-panel{flex:1;background:#000;display:flex;align-items:center;justify-content:center;min-width:0}
+.stream-panel img{max-width:100%;max-height:100%;object-fit:contain}
+.sidebar{width:260px;background:#111;border-left:1px solid #222;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:12px;flex-shrink:0}
+.card{background:#191919;border:1px solid #252525;border-radius:8px;padding:12px}
+.card h3{font-size:10px;font-weight:600;color:#555;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
+.stat{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:13px}
+.stat-label{color:#666}
+.stat-value{color:#ccc;font-variant-numeric:tabular-nums}
+.laser-on{color:#f44;font-weight:700}
+.laser-off{color:#444}
+.btn{display:block;width:100%;background:#222;color:#bbb;border:1px solid #333;border-radius:6px;padding:9px 12px;margin-bottom:6px;cursor:pointer;font-size:13px;text-align:left;transition:background .15s}
+.btn:hover{background:#2c2c2c;color:#fff}
+.btn:last-child{margin-bottom:0}
+.btn-danger{border-color:#5a1515;color:#f77}
+.btn-danger:hover{background:#2a1010}
+.btn-ok{border-color:#1a4a1a;color:#7d7}
+.btn-ok:hover{background:#0f200f}
+.calib-info{font-size:11px;color:#555;margin-top:8px}
+</style></head><body>
+""" + _NAV + """
+<div class="layout">
+  <div class="stream-panel"><img src="/stream.mjpg"/></div>
+  <div class="sidebar">
+
+    <div class="card">
+      <h3>Sistem Durumu</h3>
+      <div class="stat"><span class="stat-label">FPS</span><span class="stat-value" id="s-fps">—</span></div>
+      <div class="stat"><span class="stat-label">Tracks</span><span class="stat-value" id="s-trk">—</span></div>
+      <div class="stat"><span class="stat-label">Lazer</span><span class="stat-value laser-off" id="s-laz">—</span></div>
+      <div class="stat"><span class="stat-label">Hedef ID</span><span class="stat-value" id="s-tid">—</span></div>
+      <div class="stat"><span class="stat-label">İmha</span><span class="stat-value" id="s-kld">—</span></div>
+      <div class="stat"><span class="stat-label">Pan</span><span class="stat-value" id="s-pan">—</span></div>
+      <div class="stat"><span class="stat-label">Tilt</span><span class="stat-value" id="s-tlt">—</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Operasyon</h3>
+      <button class="btn btn-danger" onclick="post('/laser/off')">⬛ Lazer KAPAT</button>
+      <button class="btn" onclick="post('/laser/on')">🔴 Lazer AÇ (test)</button>
+      <button class="btn" onclick="post('/reset')">↺ Hedef Listesini Sıfırla</button>
+    </div>
+
+    <div class="card">
+      <h3>Kalibrasyon</h3>
+      <a href="/calibrate"><button class="btn btn-ok" style="width:100%">⚙ Kalibrasyon Arayüzü</button></a>
+      <div class="calib-info" id="s-cal">Yükleniyor...</div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+document.getElementById('nav-control').classList.add('active')
+function post(u){fetch(u,{method:'POST'}).then(r=>r.json()).then(d=>console.log(d)).catch(()=>{})}
+function refresh(){
+  fetch('/status').then(r=>r.json()).then(d=>{
+    document.getElementById('s-fps').textContent = d.fps+' fps'
+    document.getElementById('s-trk').textContent = d.tracks
+    const lEl=document.getElementById('s-laz')
+    if(d.laser){lEl.textContent='AÇIK';lEl.className='stat-value laser-on'}
+    else{lEl.textContent='kapalı';lEl.className='stat-value laser-off'}
+    document.getElementById('s-tid').textContent = d.target_id??'—'
+    document.getElementById('s-kld').textContent = d.killed
+    document.getElementById('s-pan').textContent = d.pan_deg+'°'
+    document.getElementById('s-tlt').textContent = d.tilt_deg+'°'
+  }).catch(()=>{})
+  fetch('/calibrate/status').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('s-cal')
+    if(d.has_calibration_file){
+      const ox=(d.laser_offset_px_x||0).toFixed(1),oy=(d.laser_offset_px_y||0).toFixed(1)
+      el.textContent='Offset: ('+ox+', '+oy+') px'
+    } else {el.textContent='Kalibrasyon yok — offset=(0,0)'}
+  }).catch(()=>{})
+}
+setInterval(refresh,1000);refresh()
+</script></body></html>"""
+
+CALIBRATE_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Turret — Kalibrasyon</title>
+<style>
+""" + _NAV_CSS + """
+.content{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+.card{background:#191919;border:1px solid #252525;border-radius:8px;padding:14px}
+.card h3{font-size:10px;font-weight:600;color:#555;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
+.steps{color:#7ab;font-size:13px;line-height:2}
+.btn{background:#222;color:#bbb;border:1px solid #333;border-radius:6px;padding:9px 16px;cursor:pointer;font-size:13px;transition:background .15s;margin-right:6px}
+.btn:hover{background:#2c2c2c;color:#fff}
+.btn-ok{border-color:#1a4a1a;color:#7d7}.btn-ok:hover{background:#0f200f}
+.btn-danger{border-color:#5a1515;color:#f77}.btn-danger:hover{background:#2a1010}
+#stream-wrap{position:relative;display:inline-block}
+#stream{max-width:100%;cursor:crosshair;border:2px solid #2a2a2a;border-radius:6px;display:block}
+#marker{position:absolute;width:24px;height:24px;pointer-events:none;border:2px solid #f44;border-radius:50%;display:none;transform:translate(-50%,-50%)}
+#info{font-size:13px;color:#888;min-height:18px}
+#cal-status{font-size:12px;color:#555;white-space:pre;margin-top:8px}
+input[type=number]{background:#1a1a1a;color:#ddd;border:1px solid #333;padding:6px 10px;border-radius:5px;width:90px;font-size:13px}
+</style></head><body>
+""" + _NAV + """
+<div class="content">
+
+<div class="card">
+  <h3>Nasıl Yapılır?</h3>
+  <div class="steps">
+    1. Kalibrasyonu Başlat → servolar merkeze gider, lazer açılır<br>
+    2. Hedefi <b>~150 cm</b> mesafeye koy (kağıt yüzeye lazer noktasını düşür)<br>
+    3. Aşağıdaki stream'de <b>lazer noktasının tam merkezine</b> tıkla<br>
+    4. Mesafeyi gir → Onayla ve Kaydet
+  </div>
+</div>
+
+<div class="card">
+  <h3>Kontroller</h3>
+  <button class="btn btn-ok" onclick="startCalib()">▶ Kalibrasyonu Başlat</button>
+  <button class="btn btn-danger" onclick="cancelCalib()">✕ İptal</button>
+  <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
+    <label style="font-size:13px;color:#888">Mesafe (cm):</label>
+    <input id="dist" type="number" value="150" min="30" max="500">
+    <button class="btn btn-ok" onclick="doConfirm()">✓ Onayla ve Kaydet</button>
+  </div>
+  <div id="info" style="margin-top:10px">Henüz başlatılmadı.</div>
+</div>
+
+<div class="card">
+  <h3>Canlı Stream — Lazer Noktasına Tıkla</h3>
+  <div id="stream-wrap">
+    <img id="stream" src="/stream.mjpg" onclick="onStreamClick(event)"/>
+    <div id="marker"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Mevcut Kalibrasyon</h3>
+  <div id="cal-status">Yükleniyor...</div>
+</div>
+
+</div>
+<script>
+document.getElementById('nav-cal').classList.add('active')
+let clickX=null,clickY=null
+
+function startCalib(){
+  fetch('/calibrate/start',{method:'POST'}).then(r=>r.json()).then(()=>{
+    document.getElementById('info').textContent='Lazer açık. Stream\'de lazer noktasına tıklayın.'
+    refreshStatus()
+  })
+}
+function onStreamClick(e){
+  const img=document.getElementById('stream')
+  const r=img.getBoundingClientRect()
+  clickX=Math.round((e.clientX-r.left)*(img.naturalWidth/r.width))
+  clickY=Math.round((e.clientY-r.top)*(img.naturalHeight/r.height))
+  const m=document.getElementById('marker')
+  m.style.left=(e.clientX-r.left)+'px';m.style.top=(e.clientY-r.top)+'px';m.style.display='block'
+  document.getElementById('info').textContent='Seçilen: ('+clickX+', '+clickY+') px — Onayla ya da farklı noktaya tıkla.'
+  fetch('/calibrate/click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:clickX,y:clickY})})
+}
+function doConfirm(){
+  if(clickX===null){alert('Önce lazer noktasına tıklayın.');return}
+  const dist=parseInt(document.getElementById('dist').value)||150
+  fetch('/calibrate/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({distance_cm:dist})})
+  .then(r=>r.json()).then(d=>{
+    document.getElementById('info').textContent=d.status==='error'?'Hata: '+d.msg
+      :'✓ Kaydedildi! offset=('+d.offset_px_x+', '+d.offset_px_y+')px @ '+d.distance_cm+'cm'
+    refreshStatus()
+  })
+}
+function cancelCalib(){
+  fetch('/calibrate/cancel',{method:'POST'}).then(()=>{
+    document.getElementById('info').textContent='İptal edildi.'
+    document.getElementById('marker').style.display='none'
+    clickX=null;clickY=null;refreshStatus()
+  })
+}
+function refreshStatus(){
+  fetch('/calibrate/status').then(r=>r.json()).then(d=>{
+    const ox=(d.laser_offset_px_x||0).toFixed(2),oy=(d.laser_offset_px_y||0).toFixed(2)
+    document.getElementById('cal-status').textContent=d.has_calibration_file
+      ?'offset_px  : ('+ox+', '+oy+')\ncalibrating: '+d.calibrating
+      :'Kalibrasyon dosyası yok — offset=(0,0)'
+  })
+}
+refreshStatus();setInterval(refreshStatus,3000)
+
+<div id="steps">
+  1. "Kalibrasyonu Başlat"a tıkla — servolar merkeze gider, lazer açılır<br>
+  2. Hedefi <b>~150 cm</b> mesafeye koy (kağıt yüzeye lazer noktasını düşür)<br>
+  3. Aşağıdaki stream'de <b>lazer noktasının tam merkezine</b> tıkla<br>
+  4. Mesafeyi gir ve "Onayla ve Kaydet"e bas
+</div>
+
+<div>
+  <button class="ok" onclick="startCalib()">Kalibrasyonu Başlat</button>
+  <button class="danger" onclick="cancelCalib()">İptal</button>
+</div>
+
+<div id="canvas-wrap">
+  <img id="stream" src="/stream.mjpg" onclick="onStreamClick(event)"/>
+  <div id="marker"></div>
+</div>
+
+<div id="info">Henüz tıklanmadı.</div>
+
+<div style="margin-top:12px">
+  Kalibrasyon mesafesi (cm):
+  <input id="dist" type="number" value="150" min="30" max="500">
+  <button class="ok" onclick="doConfirm()">Onayla ve Kaydet</button>
+</div>
+
+<div id="status"></div>
+
+<script>
+let clickX = null, clickY = null;
+
+function startCalib() {
+  fetch('/calibrate/start', {method:'POST'}).then(r=>r.json()).then(d=>{
+    document.getElementById('info').textContent =
+      'Kalibrasyon modu aktif — lazer açık. Stream üzerinde lazer noktasına tıklayın.';
+    refreshStatus();
+  });
+}
+
+function onStreamClick(e) {
+  const img = document.getElementById('stream');
+  const rect = img.getBoundingClientRect();
+  const scaleX = img.naturalWidth / rect.width;
+  const scaleY = img.naturalHeight / rect.height;
+  clickX = Math.round((e.clientX - rect.left) * scaleX);
+  clickY = Math.round((e.clientY - rect.top)  * scaleY);
+
+  const marker = document.getElementById('marker');
+  marker.style.left = (e.clientX - rect.left) + 'px';
+  marker.style.top  = (e.clientY - rect.top)  + 'px';
+  marker.style.display = 'block';
+
+  document.getElementById('info').textContent =
+    'Seçilen: (' + clickX + ', ' + clickY + ') px. Onayla ya da farklı bir noktaya tıkla.';
+
+  fetch('/calibrate/click', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({x: clickX, y: clickY})
+  });
+}
+
+function doConfirm() {
+  if (clickX === null) { alert('Önce lazer noktasına tıklayın.'); return; }
+  const dist = parseInt(document.getElementById('dist').value) || 150;
+  fetch('/calibrate/confirm', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({distance_cm: dist})
+  }).then(r=>r.json()).then(d=>{
+    if (d.status === 'error') {
+      document.getElementById('info').textContent = 'Hata: ' + d.msg;
+    } else {
+      document.getElementById('info').textContent =
+        'Kaydedildi! offset=(' + d.offset_px_x + ', ' + d.offset_px_y + ')px @ ' + d.distance_cm + 'cm';
+    }
+    refreshStatus();
+  });
+}
+
+function cancelCalib() {
+  fetch('/calibrate/cancel', {method:'POST'}).then(r=>r.json()).then(()=>{
+    document.getElementById('info').textContent = 'İptal edildi.';
+    document.getElementById('marker').style.display = 'none';
+    clickX = null; clickY = null;
+    refreshStatus();
+  });
+}
+
+function refreshStatus() {
+  fetch('/calibrate/status').then(r=>r.json()).then(d=>{
+    document.getElementById('status').textContent = JSON.stringify(d, null, 2);
+  });
+}
+
+refreshStatus();
+setInterval(refreshStatus, 3000);
+</script></body></html>"""
 
 
 def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
@@ -438,6 +807,14 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+        def _json_ok(self, payload: dict):
+            body = _json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 self._send_page(PAGE)
@@ -447,6 +824,105 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 self._stream(buf_main)
             elif self.path == "/debug.mjpg":
                 self._stream(buf_debug)
+            elif self.path == "/control":
+                self._send_page(CONTROL_PAGE)
+            elif self.path == "/calibrate":
+                self._send_page(CALIBRATE_PAGE)
+            elif self.path == "/status":
+                with data_lock:
+                    snapshot = dict(web_status)
+                self._json_ok(snapshot)
+            elif self.path == "/calibrate/status":
+                self._json_ok({
+                    "laser_offset_px_x":  LASER_OFFSET_PX_X,
+                    "laser_offset_px_y":  LASER_OFFSET_PX_Y,
+                    "calibrating":        calibrating,
+                    "has_calibration_file": os.path.exists(CALIB_PATH),
+                })
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            global calibrating, calib_click_px, current_target_id, killed_flies
+            global LASER_OFFSET_PX_X, LASER_OFFSET_PX_Y
+
+            if self.path == "/laser/off":
+                with data_lock:
+                    current_target_id = None
+                    target_pan_deg    = 90.0
+                    target_tilt_deg   = 90.0
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                log("[WEB] Lazer zorla kapatıldı.")
+                self._json_ok({"status": "laser_off"})
+
+            elif self.path == "/laser/on":
+                if HAS_GPIO and lazer:
+                    lazer.on()
+                log("[WEB] Lazer manuel açıldı (test — state machine override edebilir).")
+                self._json_ok({"status": "laser_on", "warning": "state machine may override"})
+
+            elif self.path == "/reset":
+                with data_lock:
+                    killed_flies.clear()
+                    current_target_id = None
+                log("[WEB] Hedef listesi sıfırlandı.")
+                self._json_ok({"status": "reset"})
+
+            elif self.path == "/calibrate/start":
+                with data_lock:
+                    calibrating       = True
+                    calib_click_px    = None
+                    current_target_id = None
+                    target_pan_deg    = 90.0
+                    target_tilt_deg   = 90.0
+                if HAS_GPIO and lazer:
+                    lazer.on()
+                log("[KALİBRASYON] Kalibrasyon modu başlatıldı.")
+                self._json_ok({"status": "calibrating"})
+
+            elif self.path == "/calibrate/click":
+                length = int(self.headers.get("Content-Length", 0))
+                body   = _json.loads(self.rfile.read(length))
+                with data_lock:
+                    calib_click_px = (float(body["x"]), float(body["y"]))
+                self._json_ok({"status": "click_received", "x": body["x"], "y": body["y"]})
+
+            elif self.path == "/calibrate/confirm":
+                length = int(self.headers.get("Content-Length", 0))
+                body   = _json.loads(self.rfile.read(length)) if length else {}
+                distance_cm = int(body.get("distance_cm", 150))
+                with data_lock:
+                    click       = calib_click_px
+                    calibrating = False
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                if click is None:
+                    self._json_ok({"status": "error", "msg": "Önce lazer noktasına tıkla"})
+                    return
+                proc_x   = click[0] * (PROCESS_W / CAPTURE_W)
+                proc_y   = click[1] * (PROCESS_H / CAPTURE_H)
+                offset_x = proc_x - PROCESS_W / 2
+                offset_y = proc_y - PROCESS_H / 2
+                _save_calibration(offset_x, offset_y, distance_cm)
+                LASER_OFFSET_PX_X = offset_x
+                LASER_OFFSET_PX_Y = offset_y
+                self._json_ok({
+                    "status":      "calibrated",
+                    "offset_px_x": round(offset_x, 1),
+                    "offset_px_y": round(offset_y, 1),
+                    "distance_cm": distance_cm,
+                })
+
+            elif self.path == "/calibrate/cancel":
+                with data_lock:
+                    calibrating    = False
+                    calib_click_px = None
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                log("[KALİBRASYON] İptal edildi.")
+                self._json_ok({"status": "cancelled"})
+
             else:
                 self.send_error(404)
     return H
@@ -514,6 +990,8 @@ def motor_smooth_thread():
 def main() -> None:
     global current_target_id, lock_start_time, target_pan_deg, target_tilt_deg, is_running
     global pan_servo, tilt_servo, lazer
+
+    _load_calibration()
 
     # Donanım Başlatma Kontrolleri
     trigger = LED(TRIGGER_PIN) if HAS_GPIO else None
@@ -592,6 +1070,27 @@ def main() -> None:
             enhanced, motion, motion_exclude, blackhat, combined = pipeline.process(gray)
 
             if frame_idx < WARMUP_FRAMES:
+                frame_idx += 1
+                continue
+
+            # KALIBRASYON MODU — detection ve tracking duraklatılır
+            if calibrating:
+                tracker.tracks.clear()
+                overlay = frame.copy()
+                cv2.drawMarker(overlay, (CAPTURE_W // 2, CAPTURE_H // 2),
+                               (0, 255, 255), cv2.MARKER_CROSS, 40, 2)
+                cv2.putText(overlay, "KALIBRASYON — Lazer noktasina tiklayin",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (0, 255, 255), 2, cv2.LINE_AA)
+                with data_lock:
+                    click = calib_click_px
+                if click is not None:
+                    cv2.drawMarker(overlay, (int(click[0]), int(click[1])),
+                                   (0, 0, 255), cv2.MARKER_TILTED_CROSS, 30, 2)
+                if ENABLE_STREAM:
+                    ok, jpg = cv2.imencode(".jpg", overlay, encode)
+                    if ok:
+                        buf_main.update(jpg.tobytes())
                 frame_idx += 1
                 continue
 
@@ -713,8 +1212,8 @@ def main() -> None:
                                 tilt_servo.detach()
                         else:
                             # 3 saniye henüz dolmadı, sineği pürüzsüzce merkeze doğru takip et
-                            error_x = tr.cx - (PROCESS_W / 2)  # 320 px merkez farkı
-                            error_y = tr.cy - (PROCESS_H / 2)  # 180 px merkez farkı
+                            error_x = tr.cx - (PROCESS_W / 2 + LASER_OFFSET_PX_X)
+                            error_y = tr.cy - (PROCESS_H / 2 + LASER_OFFSET_PX_Y)
 
                             # Proportional Kontrol Katsayıları
                             kp_x = 0.040
@@ -750,6 +1249,20 @@ def main() -> None:
                             lazer.on()
                         log(f"[KİLİTLENDİ] Hedef ID: {tr.track_id} yakalandı! Lazer AÇIK.")
                         break
+
+            # Web durum snapshot'ı — HTTP handler thread'leri buradan okur
+            with data_lock:
+                web_status.update({
+                    "fps":       round(fps, 1),
+                    "tracks":    len(tracker.tracks),
+                    "confirmed": len(confirmed),
+                    "laser":     bool(lazer.is_lit) if HAS_GPIO and lazer else False,
+                    "target_id": current_target_id,
+                    "killed":    len(killed_flies),
+                    "pan_deg":   round(current_pan_deg, 1),
+                    "tilt_deg":  round(current_tilt_deg, 1),
+                    "calibrating": calibrating,
+                })
 
             # Orijinal röle tetikleyici mekanizması
             for tr in confirmed:
