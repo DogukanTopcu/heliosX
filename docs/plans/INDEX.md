@@ -20,15 +20,15 @@ Her plan kendi `.md` dosyasında ayrıntılı olarak açıklanmıştır.
 | # | Plan | Dosya | Durum |
 |---|---|---|---|
 | P5 | Systemd Servis / Otomatik Başlatma | [P5-systemd.md](P5-systemd.md) | Tamamlandı |
-| P6 | Çoklu Hedef Önceliklendirme | [P6-multi-target.md](P6-multi-target.md) | Bekliyor |
-| P7 | Adaptif Servo Kazanımı (Mesafeye Göre KP) | [P7-adaptive-gain.md](P7-adaptive-gain.md) | Bekliyor |
+| P6 | Çoklu Hedef Önceliklendirme | [P6-multi-target.md](P6-multi-target.md) | Tamamlandı |
+| P7 | Adaptif Servo Kazanımı (Mesafeye Göre KP) | [P7-adaptive-gain.md](P7-adaptive-gain.md) | Tamamlandı |
 
 ### Nice-to-Have — Sistem olgunlaştıkça
 
 | # | Plan | Dosya | Durum |
 |---|---|---|---|
 | P8 | Web Kontrol Paneli | [P8-web-control.md](P8-web-control.md) | Tamamlandı |
-| P9 | Kalman Filtresi ile Gelişmiş Tahmin | [P9-kalman.md](P9-kalman.md) | Bekliyor |
+| P9 | Kalman Filtresi ile Gelişmiş Tahmin | [P9-kalman.md](P9-kalman.md) | Tamamlandı |
 | P10 | Gece Modu / Adaptif Pozlama | [P10-night-mode.md](P10-night-mode.md) | Bekliyor |
 
 ## Plan Bağımlılık Sırası

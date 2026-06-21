@@ -104,6 +104,11 @@ PAN_MAX_DEG  = 150.0
 TILT_MIN_DEG = 45.0
 TILT_MAX_DEG = 135.0
 
+# Adaptif servo kazanımı — hata büyükse hızlı, küçükse hassas
+KP_BASE          = 0.020   # küçük hata (<5 px) — hassas ince ayar modu
+KP_BOOST         = 0.060   # büyük hata (>=BOOST_ERR px) — hızlı yakalama modu
+KP_BOOST_ERROR_PX = 80.0   # bu piksel hatasından itibaren KP_BOOST'a geçilir
+
 # Lazer-Kamera fiziksel offset (piksel, 640×360 process çözünürlüğünde)
 # Pozitif X: lazer kamera merkezinin sağında; Pozitif Y: lazer kamera merkezinin altında
 # Kalibrasyon sonrası calibration.json'dan otomatik yüklenir, burayı manuel değiştirme
@@ -219,6 +224,10 @@ def deg_to_servo_val(deg):
     """ 0-180 dereceyi gpiozero'nun -1.0 ile 1.0 skalasına çevirir """
     return (deg / 90.0) - 1.0
 
+def adaptive_kp(error_px: float) -> float:
+    t = min(abs(error_px) / KP_BOOST_ERROR_PX, 1.0)
+    return KP_BASE + t * (KP_BOOST - KP_BASE)
+
 def ensure_odd(n: int, minimum: int = 3) -> int:
     n = max(n, minimum)
     return n if n % 2 == 1 else n + 1
@@ -254,9 +263,38 @@ class Track:
     triggered: bool = False
     history: deque = field(default_factory=lambda: deque(maxlen=TRAJECTORY_WINDOW))
     last_score: float = 0.0
+    kf: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        dt = 1.0
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0],
+            [0, 1,  0, dt],
+            [0, 0,  1,  0],
+            [0, 0,  0,  1],
+        ], dtype=np.float32)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        self.kf.processNoiseCov[2, 2] = 5.0
+        self.kf.processNoiseCov[3, 3] = 5.0
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 4.0
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+        self.kf.statePost = np.array(
+            [[self.cx], [self.cy], [0.0], [0.0]], dtype=np.float32
+        )
+        self._pred_cx: float = self.cx
+        self._pred_cy: float = self.cy
+
+    def kalman_predict(self) -> tuple[float, float]:
+        pred = self.kf.predict()
+        return (float(pred[0]), float(pred[1]))
 
     def predict(self) -> tuple[float, float]:
-        return (self.cx + self.vx, self.cy + self.vy)
+        return (self._pred_cx, self._pred_cy)
 
     def speed(self) -> float:
         return math.hypot(self.vx, self.vy)
@@ -298,6 +336,11 @@ class Tracker:
         self.tracks: dict[int, Track] = {}
 
     def update(self, dets: list[Detection], frame_idx: int) -> None:
+        for tr in self.tracks.values():
+            px, py = tr.kalman_predict()
+            tr._pred_cx = px
+            tr._pred_cy = py
+
         unmatched_tracks = set(self.tracks.keys())
         unmatched_dets = set(range(len(dets)))
 
@@ -318,11 +361,12 @@ class Tracker:
             unmatched_dets.remove(di)
             d = dets[di]
             tr = self.tracks[tid]
-            new_vx = d.cx - tr.cx
-            new_vy = d.cy - tr.cy
-            tr.vx = 0.5 * tr.vx + 0.5 * new_vx
-            tr.vy = 0.5 * tr.vy + 0.5 * new_vy
-            tr.cx, tr.cy = float(d.cx), float(d.cy)
+            meas = np.array([[float(d.cx)], [float(d.cy)]], dtype=np.float32)
+            corrected = tr.kf.correct(meas)
+            tr.cx = float(corrected[0])
+            tr.cy = float(corrected[1])
+            tr.vx = float(corrected[2])
+            tr.vy = float(corrected[3])
             tr.hits += 1
             tr.age += 1
             tr.misses = 0
@@ -346,10 +390,10 @@ class Tracker:
             tr = self.tracks[tid]
             tr.misses += 1
             tr.age += 1
-            tr.vx *= 0.7
-            tr.vy *= 0.7
-            tr.cx += tr.vx
-            tr.cy += tr.vy
+            tr.cx = tr._pred_cx
+            tr.cy = tr._pred_cy
+            tr.vx = float(tr.kf.statePost[2])
+            tr.vy = float(tr.kf.statePost[3])
             if tr.misses > MAX_MISSED:
                 expired.append(tid)
         for tid in expired:
@@ -370,6 +414,13 @@ class Tracker:
                 continue
             out.append(tr)
         return out
+
+
+def candidate_score(tr: "Track") -> float:
+    dist = math.hypot(tr.cx - PROCESS_W / 2, tr.cy - PROCESS_H / 2)
+    max_dist = math.hypot(PROCESS_W / 2, PROCESS_H / 2)
+    proximity = 1.0 - (dist / max_dist)
+    return tr.hits * 3.0 + tr.path_length() * 0.5 + proximity * 20.0 + tr.last_score * 5.0
 
 
 # =========================================================================
@@ -1215,9 +1266,9 @@ def main() -> None:
                             error_x = tr.cx - (PROCESS_W / 2 + LASER_OFFSET_PX_X)
                             error_y = tr.cy - (PROCESS_H / 2 + LASER_OFFSET_PX_Y)
 
-                            # Proportional Kontrol Katsayıları
-                            kp_x = 0.040
-                            kp_y = 0.040
+                            # Adaptif kazanım: hata büyükse KP_BOOST, küçükse KP_BASE
+                            kp_x = adaptive_kp(error_x)
+                            kp_y = adaptive_kp(error_y)
 
                             with data_lock:
                                 target_pan_deg  = max(PAN_MIN_DEG,  min(PAN_MAX_DEG,
@@ -1240,15 +1291,21 @@ def main() -> None:
 
             # ADIM 3: Eğer sistem boştaysa ve yeni bir aday sinek geldiyse kilitlen
             if current_target_id is None:
-                for tr in active_tracks:
-                    if tr.track_id not in killed_flies and tr.hits >= MIN_HITS:
-                        current_target_id = tr.track_id
-                        lock_start_time = now
-                        target_still_visible = True  # Aynı frame içerisinde hedef kaçtı kontrolüne düşmemesi için
-                        if HAS_GPIO:
-                            lazer.on()
-                        log(f"[KİLİTLENDİ] Hedef ID: {tr.track_id} yakalandı! Lazer AÇIK.")
-                        break
+                candidates = [
+                    tr for tr in active_tracks
+                    if tr.track_id not in killed_flies and tr.hits >= MIN_HITS
+                ]
+                if candidates:
+                    best = max(candidates, key=candidate_score)
+                    best_score = candidate_score(best)
+                    current_target_id = best.track_id
+                    lock_start_time = now
+                    target_still_visible = True  # Aynı frame içerisinde hedef kaçtı kontrolüne düşmemesi için
+                    if HAS_GPIO:
+                        lazer.on()
+                    log(f"[KİLİTLENDİ] Hedef ID: {best.track_id} "
+                        f"skor={best_score:.1f} hits={best.hits} "
+                        f"path={best.path_length():.1f}px. Lazer AÇIK.")
 
             # Web durum snapshot'ı — HTTP handler thread'leri buradan okur
             with data_lock:
@@ -1300,6 +1357,10 @@ def main() -> None:
                 else:
                     color = (0, 200, 200) if tr.hits < MIN_HITS else (0, 255, 0)
                 cv2.circle(frame, (px, py), 12, color, 1)
+                if tr.hits >= MIN_HITS and tr.track_id not in killed_flies and tr.track_id != current_target_id:
+                    cv2.putText(frame, f"{candidate_score(tr):.0f}",
+                                (px + 14, py + 4), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.35, color, 1, cv2.LINE_AA)
 
             for tr in confirmed:
                 px = int(tr.cx * sx)
