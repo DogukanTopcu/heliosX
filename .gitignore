@@ -1,0 +1,39 @@
+# Logs
+*.log
+v2/detections.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# PID and runtime files
+*.pid
+camera-stream/camera-stream.target
+
+# SSH keys and credentials
+.ssh/
+
+# System / editor
+.cache/
+.config/
+.local/
+.warp/
+.claude/
+.claude.json
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.python_history
+.sudo_as_admin_successful
+.cloud-locale-test.skip
+.wget-hsts
+
+# Saved frames / captured data
+v2/frames/
+camera-stream/fly-detector/frames/
+
+# Empty placeholder folders
+dogu/
+kerem/
