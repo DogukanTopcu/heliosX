@@ -37,3 +37,6 @@ camera-stream/fly-detector/frames/
 # Empty placeholder folders
 dogu/
 kerem/
+.codex/
+.warp/
+.local/share/claude/
