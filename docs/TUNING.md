@@ -125,7 +125,8 @@ Bu blok loş veya değişken ışıkta shutter/gain güncellemesi yapar. Motion-
 | `KP_BASE` | 0.020 | Küçük hatalarda hassas takip |
 | `KP_BOOST` | 0.060 | Büyük hatalarda hızlı yakalama |
 | `KP_BOOST_ERROR_PX` | 80.0 | Boost etkisinin doygunlaştığı hata büyüklüğü |
-| `smooth_factor` | 0.22 | Servo thread içindeki lerp oranı |
+| `SERVO_MOVE_DURATION` | 0.25 s | Bir hedef komutunun cubic ease-in-out hareket süresi |
+| `SERVO_MOVE_STEPS` | 50 | Hareket boyunca gönderilen açı adımı sayısı |
 
 ## Calibration notes
 
@@ -145,7 +146,7 @@ Bu blok loş veya değişken ışıkta shutter/gain güncellemesi yapar. Motion-
 | Mosquito not detected | Lower `MIN_AREA`, lower `BLACK_THRESHOLD`, lower `MIN_DARK_SCORE`, tune exposure |
 | Hand triggers detection | Lower `LARGE_MOTION_AREA`, lower `LARGE_MOTION_DIM`, lower `MAX_GLOBAL_MOTION_RATIO` |
 | Tracks die too quickly | Raise `MAX_MISSED`, raise `MATCH_DISTANCE` |
-| Servo oscillates | Lower `KP_BASE` / `KP_BOOST`, lower `smooth_factor` |
-| Servo too slow | Raise `smooth_factor`, raise `KP_BOOST` |
+| Servo oscillates | Lower `KP_BASE` / `KP_BOOST`, raise `SERVO_MOVE_DURATION` |
+| Servo too slow | Lower `SERVO_MOVE_DURATION`, raise `KP_BOOST` |
 | Exposure hunting | Raise `BRIGHTNESS_WINDOW`, narrow exposure/gain range |
 | High CPU / low FPS | Lower `PROCESS_W/H`, lower `STREAM_QUALITY`, reduce overlays |

@@ -28,7 +28,7 @@ except Exception:
 os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
 
 try:
-    from gpiozero import Servo, LED
+    from gpiozero import AngularServo, LED
     HAS_GPIO = True
 except Exception:
     HAS_GPIO = False
@@ -116,15 +116,17 @@ LAZER_PIN = 14                        # Lazer Modülü GPIO pini
 # ile fiziksel olarak kalibre edildi. Pulse aralığı 0.5–2.5 ms (klon MG90S).
 # Pan:  fiziksel açı, 0° = merkez (+sağ/−sol)
 # Tilt: 0° = fiziksel alt limit; servo sinyaline çevrilirken TILT_ZERO_OFFSET eklenir
-PAN_MIN_DEG  = -45.0
-PAN_MAX_DEG  =  45.0
+PAN_MIN_DEG  =  -5.0
+PAN_MAX_DEG  =   5.0
 TILT_MIN_DEG =   0.0
-TILT_MAX_DEG =  75.0
+TILT_MAX_DEG =  10.0
 TILT_ZERO_OFFSET = 25.0    # gösterge 0° = fiziksel alt limit (25° servo konumu)
 PAN_HOME_DEG  = 0.0        # boşta/merkez pan
 TILT_HOME_DEG = 0.0        # boşta/alt-limit tilt (başlangıç konumu)
 SERVO_MIN_PW = 0.0005      # 0.5 ms
 SERVO_MAX_PW = 0.0025      # 2.5 ms
+SERVO_MOVE_DURATION = 0.25 # her hedef komutu için cubic ease süresi
+SERVO_MOVE_STEPS = 50      # 200 Hz açı güncellemesi (0.25 s / 50 adım)
 
 # Adaptif servo kazanımı — hata büyükse hızlı, küçükse hassas
 KP_BASE          = 0.020   # küçük hata (<5 px) — hassas ince ayar modu
@@ -628,13 +630,19 @@ class SyntheticCamera:
         # OpenCV sonrası kod RGB bekliyor
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-def pan_to_servo_val(deg: float) -> float:
-    """Pan fiziksel açısı (0°=merkez) → gpiozero -1.0..1.0 (manual-control5.py ile aynı)"""
-    return deg / 90.0
+def pan_to_servo_angle(deg: float) -> float:
+    """Pan gösterge açısı → AngularServo açısı (-90°..90°)."""
+    return deg
 
-def tilt_to_servo_val(deg: float) -> float:
-    """Tilt gösterge açısı (0°=alt limit) → gpiozero -1.0..1.0; TILT_ZERO_OFFSET uygulanır"""
-    return ((deg + TILT_ZERO_OFFSET) / 90.0) - 1.0
+def tilt_to_servo_angle(deg: float) -> float:
+    """Tilt gösterge açısı → AngularServo açısı; mevcut 25° fiziksel offset korunur."""
+    return deg + TILT_ZERO_OFFSET - 90.0
+
+
+def ease(t: float) -> float:
+    """Cubic ease-in-out: hareketin başında ve sonunda hızı sıfıra yaklaştırır."""
+    t = max(0.0, min(1.0, t))
+    return 4.0 * t * t * t if t < 0.5 else 1.0 - ((-2.0 * t + 2.0) ** 3) / 2.0
 
 def adaptive_kp(error_px: float) -> float:
     t = min(abs(error_px) / KP_BOOST_ERROR_PX, 1.0)
@@ -1390,51 +1398,67 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # =========================================================================
-# THREAD: MOTORLARIN PÜRÜZSÜZ LERP SÜZÜLME DÖNGÜSÜ
+# THREAD: MOTORLARIN CUBIC EASE-IN-OUT HAREKET DÖNGÜSÜ
 # =========================================================================
+def smooth_move(pan_to: float, tilt_to: float,
+                duration: float = SERVO_MOVE_DURATION,
+                steps: int = SERVO_MOVE_STEPS) -> None:
+    """İki ekseni aynı zaman çizelgesinde cubic ease-in-out ile hedefe götürür."""
+    global current_pan_deg, current_tilt_deg
+
+    pan_to = max(PAN_MIN_DEG, min(PAN_MAX_DEG, pan_to))
+    tilt_to = max(TILT_MIN_DEG, min(TILT_MAX_DEG, tilt_to))
+    pan_from = current_pan_deg
+    tilt_from = current_tilt_deg
+    steps = max(1, int(steps))
+    step_delay = max(0.0, float(duration)) / steps
+
+    for i in range(steps + 1):
+        if not is_running:
+            break
+        k = ease(i / steps)
+        current_pan_deg = pan_from + (pan_to - pan_from) * k
+        current_tilt_deg = tilt_from + (tilt_to - tilt_from) * k
+        pan_servo.angle = pan_to_servo_angle(current_pan_deg)
+        tilt_servo.angle = tilt_to_servo_angle(current_tilt_deg)
+        if i < steps and step_delay:
+            time.sleep(step_delay)
+
+
 def motor_smooth_thread():
-    """ Ana kodun döngü hızından bağımsız çalışarak motorları süzerek hedefe götürür """
+    """Ana döngüden bağımsız olarak en güncel hedefe eased hareket uygular."""
     global target_pan_deg, target_tilt_deg, current_pan_deg, current_tilt_deg, is_running
-    
-    # Geçiş pürüzsüzlük faktörü (Hızlı reaksiyon için 0.22 seçildi)
-    smooth_factor = 0.22 
+
     pan_active = False
     tilt_active = False
-    
+
     while is_running:
         with data_lock:
-            t_pan = target_pan_deg
-            t_tilt = target_tilt_deg
+            t_pan = max(PAN_MIN_DEG, min(PAN_MAX_DEG, target_pan_deg))
+            t_tilt = max(TILT_MIN_DEG, min(TILT_MAX_DEG, target_tilt_deg))
 
         if not HAS_GPIO or pan_servo is None or tilt_servo is None:
-            current_pan_deg = max(PAN_MIN_DEG, min(PAN_MAX_DEG, t_pan))
-            current_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG, t_tilt))
+            current_pan_deg = t_pan
+            current_tilt_deg = t_tilt
             time.sleep(0.005)
             continue
-            
-        # PAN Süzülme Kontrolü
-        pan_diff = t_pan - current_pan_deg
-        if abs(pan_diff) > 0.05:
-            current_pan_deg += pan_diff * smooth_factor
-            current_pan_deg = max(PAN_MIN_DEG, min(PAN_MAX_DEG, current_pan_deg))
-            pan_servo.value = pan_to_servo_val(current_pan_deg)
-            pan_active = True
-        elif pan_active:
-            pan_servo.detach()  # Hedefe milimetrik oturduğunda enerjiyi kes, titremesin
-            pan_active = False
 
-        # TILT Süzülme Kontrolü
-        tilt_diff = t_tilt - current_tilt_deg
-        if abs(tilt_diff) > 0.05:
-            current_tilt_deg += tilt_diff * smooth_factor
-            current_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG, current_tilt_deg))
-            tilt_servo.value = tilt_to_servo_val(current_tilt_deg)
+        pan_moving = abs(t_pan - current_pan_deg) > 0.05
+        tilt_moving = abs(t_tilt - current_tilt_deg) > 0.05
+        if pan_moving or tilt_moving:
+            smooth_move(t_pan, t_tilt)
+            # smooth_move iki servoya da açı yazar; ikisini de sonraki turda detach et.
+            pan_active = True
             tilt_active = True
-        elif tilt_active:
+            continue
+
+        if pan_active:
+            pan_servo.detach()
+            pan_active = False
+        if tilt_active:
             tilt_servo.detach()
             tilt_active = False
-            
-        time.sleep(0.005) # 5ms döngü hızı ile mükemmel donanımsal akıcılık (50 Hz PWM için ideal) [cite: 32, 33]
+        time.sleep(0.005)
 
 
 # =========================================================================
@@ -1459,14 +1483,20 @@ def main(argv=None) -> None:
     trigger = LED(TRIGGER_PIN) if HAS_GPIO and not dry_run else None
     
     if HAS_GPIO and not dry_run:
-        # Klon MG90S için 0.5–2.5 ms geniş pulse aralığı (servo-angle-finder.py ile doğrulandı)
-        pan_servo = Servo(PAN_PIN, min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW)
-        tilt_servo = Servo(TILT_PIN, min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW)
+        # AngularServo açı API'si; Pi 5 uyumlu lgpio backend ve kalibre edilmiş pulse aralığı.
+        pan_servo = AngularServo(
+            PAN_PIN, min_angle=-90, max_angle=90, initial_angle=None,
+            min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW,
+        )
+        tilt_servo = AngularServo(
+            TILT_PIN, min_angle=-90, max_angle=90, initial_angle=None,
+            min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW,
+        )
         lazer = LED(LAZER_PIN)
 
         # İlk konum: pan merkez (0°), tilt alt limit (0°); sonra enerjiyi geçici olarak kes
-        pan_servo.value = pan_to_servo_val(PAN_HOME_DEG)
-        tilt_servo.value = tilt_to_servo_val(TILT_HOME_DEG)
+        pan_servo.angle = pan_to_servo_angle(PAN_HOME_DEG)
+        tilt_servo.angle = tilt_to_servo_angle(TILT_HOME_DEG)
         time.sleep(0.3)
         pan_servo.detach()
         tilt_servo.detach()

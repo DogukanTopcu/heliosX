@@ -60,8 +60,8 @@ Bir değişiklikten sonra mümkün olan en az şu kontrol yapılır:
 ## Mevcut teknik notlar
 
 - Servo aralığı kodda `0.5–2.5 ms`
-- Pan: `-45°..45°`, `0° = merkez`
-- Tilt: `0°..75°`, `0° = fiziksel alt limit`
+- Pan: `-5°..5°`, `0° = merkez`
+- Tilt: `0°..10°`, `0° = fiziksel alt limit`
 - Pi 5 için `GPIOZERO_PIN_FACTORY=lgpio` zorunlu
 - Log dosyası `v2/detections.log`
 

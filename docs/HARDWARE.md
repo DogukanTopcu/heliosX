@@ -53,8 +53,8 @@ Tüm topraklar ortak olmalıdır: Pi GND, servo besleme GND ve lazer GND.
 ## Servo convention used in this repo
 
 - Kodda kullanılan pulse aralığı: `0.5–2.5 ms`
-- Pan gösterge açısı: `-45°..45°`, `0° = merkez`
-- Tilt gösterge açısı: `0°..75°`, `0° = fiziksel alt limit`
+- Pan gösterge açısı: `-5°..5°`, `0° = merkez`
+- Tilt gösterge açısı: `0°..10°`, `0° = fiziksel alt limit`
 - Tilt dönüşümünde `TILT_ZERO_OFFSET = 25.0` uygulanır
 
 Formüller:

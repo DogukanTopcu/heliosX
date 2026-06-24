@@ -23,12 +23,12 @@ DERECE_ADIMI = 1  # Her tuş basışında kaç derece
 TILT_ZERO_OFFSET = 25.0
 
 # Pan: fiziksel açı skalası (0°=merkez, + bir yön, - diğer yön)
-PAN_MIN_DEG  = -45.0
-PAN_MAX_DEG  =  45.0
+PAN_MIN_DEG  =  -5.0
+PAN_MAX_DEG  =   5.0
 
 # Tilt: 0° = fiziksel alt limit, yukarı artar
 TILT_MIN_DEG =   0.0
-TILT_MAX_DEG =  75.0
+TILT_MAX_DEG =  10.0
 
 # Başlangıç pozisyonları
 target_pan_deg  =  0.0
