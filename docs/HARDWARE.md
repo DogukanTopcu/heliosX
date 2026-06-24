@@ -66,6 +66,26 @@ tilt_servo_angle = tilt_deg + 25.0 - 90.0
 
 Bu dönüşüm, manuel araçlardaki gpiozero `-1..1` eşleşmesiyle elektriksel olarak aynıdır.
 
+## Servo sürücü: Donanım PWM (Pi 5, önerilen)
+
+MG90S jitter'ının başlıca yazılım kaynağı, lgpio/RPi.GPIO **yazılım PWM**'inin OS zamanlamasına bağlı darbe kaymasıdır. Pi 5'te `pigpio` **çalışmaz** (RP1 I/O çipi); doğru çözüm RP1'in **donanım PWM** kanallarıdır.
+
+- Pan pini **GPIO12 = PWM0**, Tilt pini **GPIO13 = PWM1** — ikisi de donanım PWM kanalı.
+- `new2.py` `USE_HARDWARE_PWM = True` iken `HardwarePWMServo` (kütüphane: `rpi-hardware-pwm`) kullanır; başlatılamazsa lgpio `AngularServo`'ya güvenli düşer.
+- Açı→darbe eşlemesi AngularServo ile birebir aynıdır (−90°→500µs, 0°→1500µs, +90°→2500µs).
+- Kanal eşlemesi: `PWM_CHIP=0` (kernel ≥6.12), `PAN_PWM_CHANNEL=0`, `TILT_PWM_CHANNEL=1`. Reboot sonrası eksenler ters/çalışmıyorsa yalnız bu sabitler değiştirilir.
+
+### Gerekli sistem ayarı (bir kez, reboot ister)
+
+1. `config.txt` overlay'i (GPIO12/13'ü PWM Alt0'a yönlendirir):
+   ```
+   dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+   ```
+2. `/sys/class/pwm` yazma izni için udev kuralı (`gpio` grubuna) — servis `heliosx` kullanıcısıyla, root olmadan çalıştığından gereklidir.
+3. `pip install rpi-hardware-pwm` (sistem python3'üne).
+
+> Not: Overlay aktifken GPIO12/13 PWM donanımına muxlanır; lgpio tabanlı manuel araçlar (`motor/manual-control*.py`) bu pinleri **artık süremez**.
+
 ## MG90S notes
 
 | Parameter | Value |

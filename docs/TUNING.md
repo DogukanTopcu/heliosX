@@ -28,6 +28,18 @@ Kalibrasyon akışı ayrı bir konudur; `http://heliosx.local:8080/calibrate` ar
 | `EXPOSURE_TIME_US` | 5000 µs | Düşürmek hareketi dondurur, yükseltmek karanlıkta görünürlük sağlar |
 | `ANALOGUE_GAIN` | 6.0 | Fazla yükselirse noise artar |
 
+## White balance (beyaz dengesi)
+
+Kamera açılışta `AwbEnable=True` ile başlar, ~1 sn ısınmada ortam ışığına oturan `ColourGains` değeri okunup `AwbEnable=False` ile **kilitlenir**. Bu sayede:
+
+- Renk doğru olur (sabit `(1.0, 1.0)` gain'in yarattığı **yeşil kayma** sorunu giderilir)
+- Kırmızı lazer noktası ayırt edilebilir (yeşil baskınlık `r - max(g,b)` redness skorunu çökertmez)
+- Değer sabitlendiği için kalibrasyon tekrarlanabilir kalır
+
+Metadata'dan gain okunamazsa `(2.2, 1.8)` makul varsayılanı kullanılır. Dry-run sentetik kamerada bu adım atlanır.
+
+> Not: `ColourGains` ekseni `(kırmızı_kazanç, mavi_kazanç)`. Her ikisini `1.0` sabitlemek yeşil kanalı düzeltmeden bırakır ve görüntüyü yeşile boyar — bu yüzden artık sabit değer değil, ısınma sonrası kilitlenen otomatik değer kullanılır.
+
 ## Adaptive exposure
 
 Bu blok loş veya değişken ışıkta shutter/gain güncellemesi yapar. Motion-diff temelli pipeline için agresif poz değişimi sahneyi bozabilir.

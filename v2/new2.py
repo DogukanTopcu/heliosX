@@ -33,6 +33,16 @@ try:
 except Exception:
     HAS_GPIO = False
 
+# Donanım PWM (Pi 5 RP1, GPIO12=PWM0 / GPIO13=PWM1) — jitter'sız servo darbesi.
+# Etkinleşmesi için config.txt'de `dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4`
+# ve /sys/class/pwm yazma izni (udev kuralı + gpio grubu) gerekir.
+try:
+    from rpi_hardware_pwm import HardwarePWM
+    HAS_HW_PWM = True
+except Exception:
+    HardwarePWM = None
+    HAS_HW_PWM = False
+
 
 # =========================================================================
 # AYARLAR (sahnene gore ayarla)
@@ -125,6 +135,16 @@ PAN_HOME_DEG  = 0.0        # boşta/merkez pan
 TILT_HOME_DEG = 0.0        # boşta/alt-limit tilt (başlangıç konumu)
 SERVO_MIN_PW = 0.0005      # 0.5 ms
 SERVO_MAX_PW = 0.0025      # 2.5 ms
+
+# Donanım PWM ayarları (Pi 5). USE_HARDWARE_PWM=True iken pan/tilt darbeleri RP1
+# donanım PWM'inden üretilir (lgpio yazılım PWM jitter'ı ortadan kalkar).
+# Kanal eşlemesi overlay'e bağlı: GPIO12→kanal 0 (pan), GPIO13→kanal 1 (tilt).
+# Reboot sonrası eksenler ters/çalışmıyorsa yalnız bu iki kanal sabitini değiştir.
+USE_HARDWARE_PWM  = True
+PWM_CHIP          = 0      # kernel 6.12+ tüm modellerde pwmchip0
+PAN_PWM_CHANNEL   = 0      # GPIO12 = PWM0
+TILT_PWM_CHANNEL  = 1      # GPIO13 = PWM1
+PWM_FREQ_HZ       = 50     # standart analog servo darbe frekansı (20 ms periyot)
 SERVO_MOVE_DURATION = 0.25 # her hedef komutu için cubic ease süresi
 SERVO_MOVE_STEPS = 50      # 200 Hz açı güncellemesi (0.25 s / 50 adım)
 BACKLASH_APPROACH_PAN_DEG = 0.4   # hedefe her zaman düşük açı yönünden yaklaş
@@ -834,6 +854,50 @@ class SyntheticCamera:
 
         # OpenCV sonrası kod RGB bekliyor
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+class HardwarePWMServo:
+    """RP1 donanım PWM'iyle servo sürer; AngularServo(-90..90, min/max_pulse) ile
+    birebir aynı açı→darbe eşlemesini verir. `.angle` setter ve `.detach()` arayüzü
+    motor_smooth_thread/smooth_move'un mevcut kullanımına uyumludur."""
+
+    def __init__(self, channel: int, chip: int = PWM_CHIP,
+                 min_pw_s: float = SERVO_MIN_PW, max_pw_s: float = SERVO_MAX_PW,
+                 freq_hz: int = PWM_FREQ_HZ) -> None:
+        self.period_us = 1_000_000.0 / freq_hz
+        self.min_pw_us = min_pw_s * 1e6
+        self.max_pw_us = max_pw_s * 1e6
+        self.pwm = HardwarePWM(pwm_channel=channel, hz=freq_hz, chip=chip)
+        self._started = False
+        self._angle: float | None = None
+
+    def _duty_for_angle(self, deg: float) -> float:
+        deg = max(-90.0, min(90.0, deg))
+        pw_us = self.min_pw_us + (deg + 90.0) / 180.0 * (self.max_pw_us - self.min_pw_us)
+        return pw_us / self.period_us * 100.0
+
+    @property
+    def angle(self) -> float | None:
+        return self._angle
+
+    @angle.setter
+    def angle(self, deg: float) -> None:
+        duty = self._duty_for_angle(deg)
+        if not self._started:
+            self.pwm.start(duty)
+            self._started = True
+        else:
+            self.pwm.change_duty_cycle(duty)
+        self._angle = deg
+
+    def detach(self) -> None:
+        # PWM'i durdur → hat low, servo enerjisiz (boştayken buzz/strain olmaz)
+        if self._started:
+            self.pwm.stop()
+            self._started = False
+
+    def close(self) -> None:
+        self.detach()
+
 
 def pan_to_servo_angle(deg: float) -> float:
     """Pan gösterge açısı → AngularServo açısı (-90°..90°)."""
@@ -1908,15 +1972,31 @@ def main(argv=None) -> None:
     trigger = LED(TRIGGER_PIN) if HAS_GPIO and not dry_run else None
     
     if HAS_GPIO and not dry_run:
-        # AngularServo açı API'si; Pi 5 uyumlu lgpio backend ve kalibre edilmiş pulse aralığı.
-        pan_servo = AngularServo(
-            PAN_PIN, min_angle=-90, max_angle=90, initial_angle=None,
-            min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW,
-        )
-        tilt_servo = AngularServo(
-            TILT_PIN, min_angle=-90, max_angle=90, initial_angle=None,
-            min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW,
-        )
+        # Servo sürücü: tercihen RP1 donanım PWM (jitter'sız); başlatılamazsa lgpio
+        # yazılım PWM'ine (AngularServo) güvenli düşüş — sistem yine de ayakta kalır.
+        use_hw = USE_HARDWARE_PWM and HAS_HW_PWM
+        if use_hw:
+            try:
+                pan_servo  = HardwarePWMServo(PAN_PWM_CHANNEL)
+                tilt_servo = HardwarePWMServo(TILT_PWM_CHANNEL)
+                log(f"Servo sürücü: DONANIM PWM (pwmchip{PWM_CHIP} "
+                    f"ch{PAN_PWM_CHANNEL}=GPIO{PAN_PIN} / ch{TILT_PWM_CHANNEL}=GPIO{TILT_PIN}, "
+                    f"{PWM_FREQ_HZ}Hz)")
+            except Exception as e:
+                log(f"UYARI: Donanım PWM başlatılamadı ({e}). lgpio yazılım PWM'ine "
+                    "düşülüyor — config.txt overlay'i ve /sys/class/pwm iznini kontrol et.")
+                use_hw = False
+        if not use_hw:
+            # AngularServo açı API'si; Pi 5 lgpio backend ve kalibre edilmiş pulse aralığı.
+            pan_servo = AngularServo(
+                PAN_PIN, min_angle=-90, max_angle=90, initial_angle=None,
+                min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW,
+            )
+            tilt_servo = AngularServo(
+                TILT_PIN, min_angle=-90, max_angle=90, initial_angle=None,
+                min_pulse_width=SERVO_MIN_PW, max_pulse_width=SERVO_MAX_PW,
+            )
+            log("Servo sürücü: lgpio yazılım PWM (AngularServo)")
         lazer = LED(LAZER_PIN)
 
         # İlk konum: pan merkez (0°), tilt alt limit (0°); sonra enerjiyi geçici olarak kes
@@ -1941,11 +2021,12 @@ def main(argv=None) -> None:
         if not HAS_PICAMERA2:
             raise RuntimeError("Picamera2 kullanılamıyor. Dry-run için --dry-run kullan.")
         picam2 = Picamera2()
-    # Kalibrasyon tekrarlanabilirliği için beyaz dengesi sabit; pozlama da aşağıda sabitlenir.
+    # Beyaz dengesi: ısınma sırasında AWB açık çalışır, ortam ışığına oturan ColourGains
+    # değeri okunup KİLİTLENİR. Böylece hem renk doğru olur (sabit (1,1) → yeşil kayma
+    # sorunu giderilir, kırmızı lazer ayırt edilir) hem de kalibrasyon tekrarlanabilir kalır.
     cam_controls = {
         "FrameRate": TARGET_FPS,
-        "AwbEnable": False,
-        "ColourGains": (1.0, 1.0),
+        "AwbEnable": True,
     }
     if EXPOSURE_TIME_US > 0:
         cam_controls["AeEnable"] = False
@@ -1959,7 +2040,22 @@ def main(argv=None) -> None:
     )
     picam2.configure(cfg)
     picam2.start()
-    time.sleep(1.0)
+    time.sleep(1.0)  # AWB'nin ortam ışığına oturması için bekle
+
+    # AWB oturmuş ColourGains'i oku ve kilitle (dry-run sentetik kamerada metadata yok)
+    if not dry_run and hasattr(picam2, "capture_metadata"):
+        try:
+            gains = picam2.capture_metadata().get("ColourGains")
+        except Exception:
+            gains = None
+        if not gains or len(gains) != 2 or gains[0] <= 0 or gains[1] <= 0:
+            gains = (2.2, 1.8)  # makul gündüz/iç mekan varsayılanı (yeşil kaymayı önler)
+            log(f"[KAMERA] AWB gain okunamadı, varsayılan kilit: {gains}")
+        else:
+            log(f"[KAMERA] AWB gains kilitlendi: "
+                f"R={gains[0]:.2f} B={gains[1]:.2f}")
+        picam2.set_controls({"AwbEnable": False, "ColourGains": tuple(gains)})
+        time.sleep(0.2)
     log(f"Kamera: {CAPTURE_W}x{CAPTURE_H} @ {TARGET_FPS}fps, "
         f"process {PROCESS_W}x{PROCESS_H}")
 
