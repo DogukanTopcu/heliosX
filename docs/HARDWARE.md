@@ -57,14 +57,14 @@ Tüm topraklar ortak olmalıdır: Pi GND, servo besleme GND ve lazer GND.
 - Tilt gösterge açısı: `0°..10°`, `0° = fiziksel alt limit`
 - Tilt dönüşümünde `TILT_ZERO_OFFSET = 25.0` uygulanır
 
-Formüller:
+`new2.py` içindeki `AngularServo(-90°..90°)` dönüşümleri:
 
 ```python
-pan_servo_value  = pan_deg / 90.0
-tilt_servo_value = ((tilt_deg + 25.0) / 90.0) - 1.0
+pan_servo_angle  = pan_deg
+tilt_servo_angle = tilt_deg + 25.0 - 90.0
 ```
 
-Bu eşleşme `v2/new2.py`, `motor/manual-control5.py` ve `motor/servo-angle-finder.py` ile uyumludur.
+Bu dönüşüm, manuel araçlardaki gpiozero `-1..1` eşleşmesiyle elektriksel olarak aynıdır.
 
 ## MG90S notes
 

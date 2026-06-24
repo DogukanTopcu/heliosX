@@ -127,16 +127,33 @@ Bu blok loş veya değişken ışıkta shutter/gain güncellemesi yapar. Motion-
 | `KP_BOOST_ERROR_PX` | 80.0 | Boost etkisinin doygunlaştığı hata büyüklüğü |
 | `SERVO_MOVE_DURATION` | 0.25 s | Bir hedef komutunun cubic ease-in-out hareket süresi |
 | `SERVO_MOVE_STEPS` | 50 | Hareket boyunca gönderilen açı adımı sayısı |
+| `BACKLASH_APPROACH_*_DEG` | 0.4° | Final yaklaşımın daima düşük açı yönünden başlaması |
 
 ## Calibration notes
 
 - Dosya: `~/v2/calibration.json`
 - Açılışta otomatik yüklenir
-- Web UI manuel ve otomatik kalibrasyon modları içerir
-- Polynomial fit kullanılıyorsa kalite `rms_pan_deg` / `rms_tilt_deg` ile okunur
+- Web UI üç kalibrasyon moduna sahiptir: Otomatik, 5-Nokta Manuel, Tek-Nokta Offset
+
+### Otomatik kalibrasyon (önerilen)
+- Grid mekanik sınırlardan içeridedir: pan `-4.5..4.5°`, tilt `1..9°` (6×5 = 30 nokta)
+- Her ölçümde 30 frame settle, 10 lazer gözlemi ve 8-frame median referans kullanılır
+- `<=6 px` jitter tam, `6..10 px` düşük ağırlıkla kullanılır; `>10 px` reddedilir
+- Önce linear model denenir; quadratic yalnızca reprojection hatasını en az 2 px iyileştirirse seçilir
+- Kabul kapıları: `n_samples >= 18`, açı RMS `<=1.2°`, reprojection `<=10 px`
+- Minimum piksel span dinamik hesaplanır (servo aralığı × FoV); mevcut ayarda yaklaşık `65×49 px`
+
+### 5-Nokta Manuel kalibrasyon
+- Servo 5 pozisyona gider (merkez, sol, sağ, yukarı, aşağı); kullanıcı her seferinde lazer noktasına tıklar
+- `_manual5_positions()` ile dinamik hesaplanır: pan/tilt aralığının %30'u kadar adım
+- Mevcut ayarda: merkez=(0°,5°), sol=(−3°,5°), sağ=(3°,5°), yukarı=(0°,8°), aşağı=(0°,2°)
+- Linear model fit; n_samples >= 4 ile kabul edilir (gevşek eşik)
+- JSON'a `"manual5_calibration": true` yazılır, yüklemede bu alan kontrol edilir
+
+### Ortak
+- Takip yalnız kalibrasyon örneklerinin convex hull alanında yapılır; dışarıda servo ve lazer bekler
+- Kamera çözünürlüğü, pozlama, gain veya servo sınırları değişirse eski harita yüklenmez
 - Dosyanın var olması doğru kalibrasyon anlamına gelmez
-- Kötü otomatik kalibrasyon haritası artık reddedilir; pratik kabul eşiği yaklaşık `n_samples >= 12` ve `rms_pan_deg`, `rms_tilt_deg <= 6`
-- Yalnız RMS değil, örneklerin görüntüde yeterince yayılmış olması da gerekir; dar kümelenmiş örnekler reddedilir
 
 ## Symptom → Likely Fix
 

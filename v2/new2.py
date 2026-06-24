@@ -127,6 +127,9 @@ SERVO_MIN_PW = 0.0005      # 0.5 ms
 SERVO_MAX_PW = 0.0025      # 2.5 ms
 SERVO_MOVE_DURATION = 0.25 # her hedef komutu için cubic ease süresi
 SERVO_MOVE_STEPS = 50      # 200 Hz açı güncellemesi (0.25 s / 50 adım)
+BACKLASH_APPROACH_PAN_DEG = 0.4   # hedefe her zaman düşük açı yönünden yaklaş
+BACKLASH_APPROACH_TILT_DEG = 0.4
+BACKLASH_PREMOVE_DURATION = 0.10
 
 # Adaptif servo kazanımı — hata büyükse hızlı, küçükse hassas
 KP_BASE          = 0.020   # küçük hata (<5 px) — hassas ince ayar modu
@@ -146,18 +149,25 @@ CAMERA_FOV_V_DEG = 49.0
 # Otomatik kalibrasyon — lazer noktasını görüntüde bulup piksel→servo haritası fit eder
 AUTOCAL_GRID_PAN   = 6      # pan ekseninde tarama noktası sayısı
 AUTOCAL_GRID_TILT  = 5      # tilt ekseninde tarama noktası sayısı
-AUTOCAL_SETTLE_FR  = 18     # her noktada servo+kamera oturana dek beklenen frame (~0.6s@30fps)
+AUTOCAL_GRID_PAN_MARGIN_DEG = 0.5
+AUTOCAL_GRID_TILT_MARGIN_DEG = 1.0
+AUTOCAL_SETTLE_FR  = 30     # backlash yaklaşımı + servo/kamera oturması (~1s@30fps)
 AUTOCAL_REF_FR     = 8      # referans (lazer kapalı) frame sayısı
-AUTOCAL_MEASURE_FR = 6      # settle sonrası kaç frame lazer noktası toplanacak
-AUTOCAL_MAX_JITTER_PX = 6.0 # bir grid noktasındaki lazer gözlemlerinin izinli saçılımı
+AUTOCAL_MEASURE_FR = 10     # settle sonrası kaç frame lazer noktası toplanacak
+AUTOCAL_MIN_OBSERVATIONS = 5
+AUTOCAL_GOOD_JITTER_PX = 6.0
+AUTOCAL_MAX_JITTER_PX = 10.0
 LASER_RED_MIN      = 45     # kırmızı baskınlık eşiği (R - max(G,B)), referanssız önizleme
 LASER_DIFF_MIN     = 40     # lazer açık-kapalı parlaklık farkı eşiği (doygun nokta da yakalanır)
 LASER_MIN_AREA     = 2      # px², bu alandan küçük lekeler yok sayılır
-AUTOCAL_MIN_SAMPLES = 12    # polinom fit'i kabul etmek için minimum nokta
-AUTOCAL_MAX_RMS_PAN_DEG = 6.0
-AUTOCAL_MAX_RMS_TILT_DEG = 6.0
-AUTOCAL_MIN_PX_SPAN_X = 120.0
-AUTOCAL_MIN_PX_SPAN_Y = 90.0
+AUTOCAL_MIN_SAMPLES = 18
+AUTOCAL_MIN_SPAN_RATIO = 0.67
+AUTOCAL_MAX_RMS_PAN_DEG = 1.2
+AUTOCAL_MAX_RMS_TILT_DEG = 1.2
+AUTOCAL_MAX_REPROJECTION_PX = 10.0
+AUTOCAL_QUADRATIC_MIN_IMPROVEMENT_PX = 2.0
+CALIBRATION_SCHEMA_VERSION = 2
+MANUAL5_LABELS = ["Merkez", "Pan Sol", "Pan Sağ", "Tilt Yukarı", "Tilt Aşağı"]
 
 # Stream / log
 ENABLE_STREAM = True
@@ -230,9 +240,61 @@ def _adjust_exposure(cam, brightness: float) -> bool:
     return True
 
 
+def _manual5_positions() -> list[tuple[float, float]]:
+    """5-nokta manuel kalibrasyon servo konumları: merkez, sol, sağ, yukarı, aşağı."""
+    pm = (PAN_MIN_DEG + PAN_MAX_DEG) / 2
+    tm = (TILT_MIN_DEG + TILT_MAX_DEG) / 2
+    ps = max(1.0, (PAN_MAX_DEG - PAN_MIN_DEG) * 0.30)
+    ts = max(1.0, (TILT_MAX_DEG - TILT_MIN_DEG) * 0.30)
+    return [
+        (pm,      tm),
+        (pm - ps, tm),
+        (pm + ps, tm),
+        (pm,      tm + ts),
+        (pm,      tm - ts),
+    ]
+
+
+def _minimum_calibration_span() -> tuple[float, float]:
+    """Servo aralığı ve kamera FoV'una göre gerekli minimum piksel yayılımı."""
+    expected_x = PROCESS_W * (PAN_MAX_DEG - PAN_MIN_DEG) / CAMERA_FOV_H_DEG
+    expected_y = PROCESS_H * (TILT_MAX_DEG - TILT_MIN_DEG) / CAMERA_FOV_V_DEG
+    return expected_x * AUTOCAL_MIN_SPAN_RATIO, expected_y * AUTOCAL_MIN_SPAN_RATIO
+
+
+def _calibration_compatibility_error(data: dict) -> str | None:
+    if int(data.get("schema_version", 0)) != CALIBRATION_SCHEMA_VERSION:
+        return "eski/uyumsuz şema"
+    expected = {
+        "capture_width": CAPTURE_W,
+        "capture_height": CAPTURE_H,
+        "process_width": PROCESS_W,
+        "process_height": PROCESS_H,
+        "camera_exposure_us": EXPOSURE_TIME_US,
+    }
+    for key, value in expected.items():
+        if int(data.get(key, -1)) != int(value):
+            return f"{key} değişmiş ({data.get(key)} != {value})"
+    if abs(float(data.get("camera_gain", -1.0)) - float(ANALOGUE_GAIN)) > 1e-6:
+        return "camera_gain değişmiş"
+    if data.get("pan_range") != [PAN_MIN_DEG, PAN_MAX_DEG]:
+        return "pan sınırları değişmiş"
+    if data.get("tilt_range") != [TILT_MIN_DEG, TILT_MAX_DEG]:
+        return "tilt sınırları değişmiş"
+    return None
+
+
 def _load_calibration() -> None:
     global LASER_OFFSET_PX_X, LASER_OFFSET_PX_Y
-    global HAS_PIXEL_MAP, MAP_PAN_COEF, MAP_TILT_COEF
+    global HAS_PIXEL_MAP, MAP_MODEL_TYPE, MAP_PAN_COEF, MAP_TILT_COEF
+    global CALIBRATION_SAMPLES, REACHABLE_HULL
+
+    HAS_PIXEL_MAP = False
+    MAP_MODEL_TYPE = None
+    MAP_PAN_COEF = None
+    MAP_TILT_COEF = None
+    CALIBRATION_SAMPLES = []
+    REACHABLE_HULL = None
     if not os.path.exists(CALIB_PATH):
         log("Kalibrasyon dosyası yok, offset=(0,0) kullanılıyor.")
         return
@@ -241,38 +303,46 @@ def _load_calibration() -> None:
             data = _json.load(f)
         LASER_OFFSET_PX_X = float(data.get("laser_offset_px_x", 0.0))
         LASER_OFFSET_PX_Y = float(data.get("laser_offset_px_y", 0.0))
-        if "pan_coef" in data and "tilt_coef" in data:
-            MAP_PAN_COEF  = np.array(data["pan_coef"],  dtype=np.float64)
-            MAP_TILT_COEF = np.array(data["tilt_coef"], dtype=np.float64)
-            HAS_PIXEL_MAP = MAP_PAN_COEF.shape == (6,) and MAP_TILT_COEF.shape == (6,)
-            rms_pan = float(data.get("rms_pan_deg", 999.0))
-            rms_tilt = float(data.get("rms_tilt_deg", 999.0))
-            n_samples = int(data.get("n_samples", 0))
-            px_span_x = float(data.get("px_span_x", 0.0))
-            px_span_y = float(data.get("px_span_y", 0.0))
-            if HAS_PIXEL_MAP and (
-                n_samples < AUTOCAL_MIN_SAMPLES
-                or px_span_x < AUTOCAL_MIN_PX_SPAN_X
-                or px_span_y < AUTOCAL_MIN_PX_SPAN_Y
-                or rms_pan > AUTOCAL_MAX_RMS_PAN_DEG
-                or rms_tilt > AUTOCAL_MAX_RMS_TILT_DEG
-            ):
-                log(f"[KALİBRASYON] Piksel haritası REDDEDİLDİ "
-                    f"(n={n_samples}, span={px_span_x:.0f}x{px_span_y:.0f}px, "
-                    f"rms={rms_pan}/{rms_tilt}°). "
-                    "Offset moduna düşülüyor.")
-                HAS_PIXEL_MAP = False
-                MAP_PAN_COEF = None
-                MAP_TILT_COEF = None
-        if HAS_PIXEL_MAP:
-            log(f"Piksel→servo haritası yüklendi "
-                f"(n={data.get('n_samples','?')}, "
-                f"span={data.get('px_span_x','?')}x{data.get('px_span_y','?')}px, "
-                f"rms={data.get('rms_pan_deg','?')}/{data.get('rms_tilt_deg','?')}°) "
-                f"[{data.get('calibrated_at', '?')}]")
-        else:
-            log(f"Kalibrasyon yüklendi: offset=({LASER_OFFSET_PX_X:.1f}, {LASER_OFFSET_PX_Y:.1f})px"
-                f" [{data.get('calibrated_at', '?')}] — piksel haritası yok, eski offset modu.")
+
+        if "pan_coef" not in data or "tilt_coef" not in data:
+            log(f"Kalibrasyon yüklendi: offset=({LASER_OFFSET_PX_X:.1f}, "
+                f"{LASER_OFFSET_PX_Y:.1f})px [{data.get('calibrated_at', '?')}] "
+                "— manuel offset modu.")
+            return
+
+        incompatibility = _calibration_compatibility_error(data)
+        usable, reason = _is_pixel_map_usable(data)
+        if incompatibility or not usable:
+            why = incompatibility or reason
+            log(f"[KALİBRASYON] Piksel haritası REDDEDİLDİ: {why}. "
+                "Offset moduna düşülüyor.")
+            return
+
+        model_type = str(data.get("model_type", ""))
+        coef_len = 3 if model_type == "linear" else 6
+        pan_coef = np.asarray(data["pan_coef"], dtype=np.float64)
+        tilt_coef = np.asarray(data["tilt_coef"], dtype=np.float64)
+        samples = data.get("samples", [])
+        hull = np.asarray(data.get("reachable_hull", []), dtype=np.float32)
+        if pan_coef.shape != (coef_len,) or tilt_coef.shape != (coef_len,):
+            log("[KALİBRASYON] Piksel haritası REDDEDİLDİ: katsayı boyutu hatalı.")
+            return
+        min_samp = 4 if data.get("manual5_calibration") else AUTOCAL_MIN_SAMPLES
+        if len(samples) < min_samp or hull.ndim != 2 or hull.shape[0] < 3:
+            log("[KALİBRASYON] Piksel haritası REDDEDİLDİ: örnek/hull verisi eksik.")
+            return
+
+        MAP_MODEL_TYPE = model_type
+        MAP_PAN_COEF = pan_coef
+        MAP_TILT_COEF = tilt_coef
+        CALIBRATION_SAMPLES = samples
+        REACHABLE_HULL = hull
+        HAS_PIXEL_MAP = True
+        log(f"Piksel→servo haritası yüklendi (model={model_type}, "
+            f"n={data['n_samples']}, span={data['px_span_x']}x{data['px_span_y']}px, "
+            f"rms={data['rms_pan_deg']}/{data['rms_tilt_deg']}°, "
+            f"reproj={data['reprojection_error_px']}px) "
+            f"[{data.get('calibrated_at', '?')}]")
     except Exception as e:
         log(f"Kalibrasyon dosyası okunamadı: {e} — offset=(0,0) kullanılıyor.")
 
@@ -308,64 +378,156 @@ def _detect_laser_dot(small_bgr, ref_bgr=None):
     return best
 
 
-def _poly_terms(px: float, py: float) -> np.ndarray:
-    """İkinci derece polinom tasarım vektörü: [1, px, py, px², py², px·py]"""
-    return np.array([1.0, px, py, px * px, py * py, px * py], dtype=np.float64)
+def _model_terms(a: float, b: float, model_type: str) -> np.ndarray:
+    if model_type == "linear":
+        return np.array([1.0, a, b], dtype=np.float64)
+    return np.array([1.0, a, b, a * a, b * b, a * b], dtype=np.float64)
 
 
-def _fit_pixel_to_servo(samples: list[tuple[float, float, float, float]]):
-    """samples: (pan_deg, tilt_deg, px, py). Piksel→açı için ikinci derece polinom fit.
-    Dönüş: katsayılar + RMS artık hata içeren dict, veya yetersiz veri varsa None."""
-    if len(samples) < 6:
+def _weighted_fit(A: np.ndarray, y: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    root_w = np.sqrt(np.clip(weights, 1e-6, None))
+    return np.linalg.lstsq(A * root_w[:, None], y * root_w, rcond=None)[0]
+
+
+def _weighted_rms(errors: np.ndarray, weights: np.ndarray) -> float:
+    return float(np.sqrt(np.average(np.square(errors), weights=weights)))
+
+
+def _fit_model(samples: list[dict], model_type: str) -> dict | None:
+    required = 3 if model_type == "linear" else 6
+    if len(samples) < required:
         return None
-    pan  = np.array([s[0] for s in samples], dtype=np.float64)
-    tilt = np.array([s[1] for s in samples], dtype=np.float64)
-    pxs = np.array([s[2] for s in samples], dtype=np.float64)
-    pys = np.array([s[3] for s in samples], dtype=np.float64)
-    A = np.array([_poly_terms(s[2], s[3]) for s in samples], dtype=np.float64)
-    pan_coef,  *_ = np.linalg.lstsq(A, pan,  rcond=None)
-    tilt_coef, *_ = np.linalg.lstsq(A, tilt, rcond=None)
-    rms_pan  = float(np.sqrt(np.mean((A @ pan_coef  - pan)  ** 2)))
-    rms_tilt = float(np.sqrt(np.mean((A @ tilt_coef - tilt) ** 2)))
+    pan = np.array([s["pan"] for s in samples], dtype=np.float64)
+    tilt = np.array([s["tilt"] for s in samples], dtype=np.float64)
+    pxs = np.array([s["px"] for s in samples], dtype=np.float64)
+    pys = np.array([s["py"] for s in samples], dtype=np.float64)
+    weights = np.array([s["weight"] for s in samples], dtype=np.float64)
+
+    inverse = np.array([_model_terms(x, y, model_type) for x, y in zip(pxs, pys)])
+    forward = np.array([_model_terms(p, t, model_type) for p, t in zip(pan, tilt)])
+    pan_coef = _weighted_fit(inverse, pan, weights)
+    tilt_coef = _weighted_fit(inverse, tilt, weights)
+    px_coef = _weighted_fit(forward, pxs, weights)
+    py_coef = _weighted_fit(forward, pys, weights)
+
+    pan_err = inverse @ pan_coef - pan
+    tilt_err = inverse @ tilt_coef - tilt
+    px_err = forward @ px_coef - pxs
+    py_err = forward @ py_coef - pys
+    reprojection = np.sqrt(px_err * px_err + py_err * py_err)
     return {
-        "pan_coef":  pan_coef.tolist(),
+        "model_type": model_type,
+        "pan_coef": pan_coef.tolist(),
         "tilt_coef": tilt_coef.tolist(),
-        "rms_pan_deg":  round(rms_pan, 3),
-        "rms_tilt_deg": round(rms_tilt, 3),
-        "n_samples": len(samples),
-        "px_span_x": round(float(np.max(pxs) - np.min(pxs)), 1),
-        "px_span_y": round(float(np.max(pys) - np.min(pys)), 1),
+        "forward_px_coef": px_coef.tolist(),
+        "forward_py_coef": py_coef.tolist(),
+        "rms_pan_deg": round(_weighted_rms(pan_err, weights), 3),
+        "rms_tilt_deg": round(_weighted_rms(tilt_err, weights), 3),
+        "reprojection_error_px": round(_weighted_rms(reprojection, weights), 3),
     }
+
+
+def _fit_pixel_to_servo(samples: list[dict]):
+    """Önce linear modeli dener; yalnızca anlamlı kazanç varsa quadratic seçer."""
+    if len(samples) < 3:
+        return None
+    linear = _fit_model(samples, "linear")
+    quadratic = _fit_model(samples, "quadratic")
+    selected = linear
+    if linear and quadratic:
+        improvement = linear["reprojection_error_px"] - quadratic["reprojection_error_px"]
+        if (linear["reprojection_error_px"] > AUTOCAL_MAX_REPROJECTION_PX
+                and improvement >= AUTOCAL_QUADRATIC_MIN_IMPROVEMENT_PX):
+            selected = quadratic
+    if selected is None:
+        return None
+
+    pxs = np.array([s["px"] for s in samples], dtype=np.float32)
+    pys = np.array([s["py"] for s in samples], dtype=np.float32)
+    points = np.column_stack((pxs, pys))
+    hull = cv2.convexHull(points).reshape(-1, 2)
+    selected.update({
+        "n_samples": len(samples),
+        "px_span_x": round(float(np.ptp(pxs)), 1),
+        "px_span_y": round(float(np.ptp(pys)), 1),
+        "samples": samples,
+        "reachable_hull": [[round(float(x), 2), round(float(y), 2)] for x, y in hull],
+        "linear_reprojection_error_px": linear["reprojection_error_px"] if linear else None,
+        "quadratic_reprojection_error_px": (
+            quadratic["reprojection_error_px"] if quadratic else None
+        ),
+    })
+    return selected
+
+
+def is_reachable_pixel(px: float, py: float) -> bool:
+    if not HAS_PIXEL_MAP or REACHABLE_HULL is None or len(REACHABLE_HULL) < 3:
+        return False
+    contour = np.asarray(REACHABLE_HULL, dtype=np.float32).reshape(-1, 1, 2)
+    return cv2.pointPolygonTest(contour, (float(px), float(py)), False) >= 0
 
 
 def pixel_to_servo(px: float, py: float) -> tuple[float, float]:
-    """Hedef pikselini, lazeri o piksele götürecek (pan, tilt) açısına çevirir."""
-    f = _poly_terms(px, py)
-    return float(f @ MAP_PAN_COEF), float(f @ MAP_TILT_COEF)
+    """Reachable hull içindeki hedefi yakın ölçümlerle yerel ağırlıklı affine enterpole eder."""
+    if not HAS_PIXEL_MAP or not CALIBRATION_SAMPLES:
+        raise RuntimeError("Aktif piksel→servo haritası yok")
+    distances = []
+    for sample in CALIBRATION_SAMPLES:
+        distance = math.hypot(px - sample["px"], py - sample["py"])
+        if distance < 1e-6:
+            return float(sample["pan"]), float(sample["tilt"])
+        distances.append((distance, sample))
+    nearest = sorted(distances, key=lambda item: item[0])[:8]
+    weights = np.array([float(s["weight"]) / (d * d) for d, s in nearest])
+    local = np.array(
+        [[1.0, float(s["px"]) - px, float(s["py"]) - py] for _, s in nearest],
+        dtype=np.float64,
+    )
+    pans = np.array([float(s["pan"]) for _, s in nearest], dtype=np.float64)
+    tilts = np.array([float(s["tilt"]) for _, s in nearest], dtype=np.float64)
+    try:
+        pan = float(_weighted_fit(local, pans, weights)[0])
+        tilt = float(_weighted_fit(local, tilts, weights)[0])
+    except np.linalg.LinAlgError:
+        total = float(np.sum(weights))
+        pan = float(np.sum(weights * pans) / total)
+        tilt = float(np.sum(weights * tilts) / total)
+    return pan, tilt
 
 
-def _save_pixel_map(result: dict) -> None:
-    """Otomatik kalibrasyon sonucunu calibration.json'a yazar ve haritayı aktive eder."""
-    global HAS_PIXEL_MAP, MAP_PAN_COEF, MAP_TILT_COEF
+def _save_pixel_map(result: dict, manual5: bool = False) -> None:
+    """Kalibrasyon sonucunu calibration.json'a yazar ve haritayı aktive eder."""
+    global HAS_PIXEL_MAP, MAP_MODEL_TYPE, MAP_PAN_COEF, MAP_TILT_COEF
+    global CALIBRATION_SAMPLES, REACHABLE_HULL
     data = {
-        "mode":              "pixel_servo_poly2",
-        "pan_coef":          result["pan_coef"],
-        "tilt_coef":         result["tilt_coef"],
-        "rms_pan_deg":       result["rms_pan_deg"],
-        "rms_tilt_deg":      result["rms_tilt_deg"],
-        "n_samples":         result["n_samples"],
-        "px_span_x":         result.get("px_span_x"),
-        "px_span_y":         result.get("px_span_y"),
-        "calibrated_at":     _dt.datetime.now().isoformat(timespec="seconds"),
-        "process_resolution": f"{PROCESS_W}x{PROCESS_H}",
+        **result,
+        "schema_version": CALIBRATION_SCHEMA_VERSION,
+        "mode": "pixel_servo_map",
+        "manual5_calibration": manual5,
+        "calibrated_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "capture_width": CAPTURE_W,
+        "capture_height": CAPTURE_H,
+        "process_width": PROCESS_W,
+        "process_height": PROCESS_H,
+        "camera_exposure_us": EXPOSURE_TIME_US,
+        "camera_gain": ANALOGUE_GAIN,
+        "auto_exposure": False,
+        "auto_white_balance": False,
+        "pan_range": [PAN_MIN_DEG, PAN_MAX_DEG],
+        "tilt_range": [TILT_MIN_DEG, TILT_MAX_DEG],
     }
     with open(CALIB_PATH, "w") as f:
         _json.dump(data, f, indent=2)
+    MAP_MODEL_TYPE = result["model_type"]
     MAP_PAN_COEF  = np.array(result["pan_coef"],  dtype=np.float64)
     MAP_TILT_COEF = np.array(result["tilt_coef"], dtype=np.float64)
+    CALIBRATION_SAMPLES = result["samples"]
+    REACHABLE_HULL = np.asarray(result["reachable_hull"], dtype=np.float32)
     HAS_PIXEL_MAP = True
-    log(f"[OTO-KALİBRASYON] Harita kaydedildi: n={result['n_samples']} "
-        f"rms={result['rms_pan_deg']}/{result['rms_tilt_deg']}°")
+    prefix = "[5-NOKTA KAL]" if manual5 else "[OTO-KALİBRASYON]"
+    log(f"{prefix} Harita kaydedildi: model={result['model_type']} "
+        f"n={result['n_samples']} rms={result['rms_pan_deg']}/{result['rms_tilt_deg']}° "
+        f"reproj={result['reprojection_error_px']}px")
 
 
 def _is_pixel_map_usable(result: dict | None) -> tuple[bool, str]:
@@ -374,23 +536,29 @@ def _is_pixel_map_usable(result: dict | None) -> tuple[bool, str]:
     n_samples = int(result.get("n_samples", 0))
     rms_pan = float(result.get("rms_pan_deg", 999.0))
     rms_tilt = float(result.get("rms_tilt_deg", 999.0))
+    reprojection = float(result.get("reprojection_error_px", 999.0))
     px_span_x = float(result.get("px_span_x", 0.0))
     px_span_y = float(result.get("px_span_y", 0.0))
-    if n_samples < AUTOCAL_MIN_SAMPLES:
-        return False, f"çok az örnek ({n_samples} < {AUTOCAL_MIN_SAMPLES})"
-    if px_span_x < AUTOCAL_MIN_PX_SPAN_X or px_span_y < AUTOCAL_MIN_PX_SPAN_Y:
+    min_span_x, min_span_y = _minimum_calibration_span()
+    min_samp = 4 if result.get("manual5_calibration") else AUTOCAL_MIN_SAMPLES
+    if n_samples < min_samp:
+        return False, f"çok az örnek ({n_samples} < {min_samp})"
+    if px_span_x < min_span_x or px_span_y < min_span_y:
         return False, (f"örnek yayılımı yetersiz "
                        f"(span={px_span_x:.0f}x{px_span_y:.0f}px < "
-                       f"{AUTOCAL_MIN_PX_SPAN_X:.0f}x{AUTOCAL_MIN_PX_SPAN_Y:.0f}px)")
+                       f"{min_span_x:.0f}x{min_span_y:.0f}px)")
     if rms_pan > AUTOCAL_MAX_RMS_PAN_DEG or rms_tilt > AUTOCAL_MAX_RMS_TILT_DEG:
         return False, (f"yüksek RMS hata "
                        f"({rms_pan:.1f}/{rms_tilt:.1f}° > "
                        f"{AUTOCAL_MAX_RMS_PAN_DEG:.1f}/{AUTOCAL_MAX_RMS_TILT_DEG:.1f}°)")
+    if reprojection > AUTOCAL_MAX_REPROJECTION_PX:
+        return False, (f"yüksek reprojection hatası "
+                       f"({reprojection:.1f}px > {AUTOCAL_MAX_REPROJECTION_PX:.1f}px)")
     return True, "ok"
 
 
-def _summarize_dot_samples(dots: list[tuple[float, float, float]]) -> tuple[tuple[float, float, float] | None, str | None]:
-    if len(dots) < max(3, AUTOCAL_MEASURE_FR // 2):
+def _summarize_dot_samples(dots: list[tuple[float, float, float]]) -> tuple[dict | None, str | None]:
+    if len(dots) < AUTOCAL_MIN_OBSERVATIONS:
         return None, f"yetersiz gözlem ({len(dots)})"
     xs = np.array([d[0] for d in dots], dtype=np.float64)
     ys = np.array([d[1] for d in dots], dtype=np.float64)
@@ -401,7 +569,20 @@ def _summarize_dot_samples(dots: list[tuple[float, float, float]]) -> tuple[tupl
     jitter = float(np.sqrt(np.mean((xs - mean_x) ** 2 + (ys - mean_y) ** 2)))
     if jitter > AUTOCAL_MAX_JITTER_PX:
         return None, f"yüksek jitter ({jitter:.1f}px)"
-    return (mean_x, mean_y, mean_area), None
+    if jitter <= AUTOCAL_GOOD_JITTER_PX:
+        weight = 1.0
+    else:
+        fraction = (jitter - AUTOCAL_GOOD_JITTER_PX) / (
+            AUTOCAL_MAX_JITTER_PX - AUTOCAL_GOOD_JITTER_PX
+        )
+        weight = 1.0 - 0.75 * fraction
+    return {
+        "px": mean_x,
+        "py": mean_y,
+        "area": mean_area,
+        "jitter_px": jitter,
+        "weight": max(0.25, weight),
+    }, None
 
 
 class AutoCalibrator:
@@ -410,18 +591,24 @@ class AutoCalibrator:
     dönen dict main loop'a hangi açıya gidileceğini ve lazer durumunu söyler."""
 
     def __init__(self) -> None:
-        pans  = [PAN_MIN_DEG  + (PAN_MAX_DEG  - PAN_MIN_DEG)  * i / (AUTOCAL_GRID_PAN  - 1)
+        pan_min = PAN_MIN_DEG + AUTOCAL_GRID_PAN_MARGIN_DEG
+        pan_max = PAN_MAX_DEG - AUTOCAL_GRID_PAN_MARGIN_DEG
+        tilt_min = TILT_MIN_DEG + AUTOCAL_GRID_TILT_MARGIN_DEG
+        tilt_max = TILT_MAX_DEG - AUTOCAL_GRID_TILT_MARGIN_DEG
+        pans  = [pan_min + (pan_max - pan_min) * i / (AUTOCAL_GRID_PAN - 1)
                  for i in range(AUTOCAL_GRID_PAN)]
-        tilts = [TILT_MIN_DEG + (TILT_MAX_DEG - TILT_MIN_DEG) * j / (AUTOCAL_GRID_TILT - 1)
+        tilts = [tilt_min + (tilt_max - tilt_min) * j / (AUTOCAL_GRID_TILT - 1)
                  for j in range(AUTOCAL_GRID_TILT)]
-        # Yılan (boustrophedon) sıralama — satırlar arası büyük sıçramayı azaltır
+        # Yılan sıralama yalnızca transit mesafesini azaltır; motor thread'i her hedefe
+        # düşük açı yönünden final yaklaşımı yaparak backlash yönünü sabit tutar.
         self.grid: list[tuple[float, float]] = []
         for j, t in enumerate(tilts):
             row = pans if j % 2 == 0 else list(reversed(pans))
             self.grid += [(p, t) for p in row]
         self.i = 0
-        self.samples: list[tuple[float, float, float, float]] = []
+        self.samples: list[dict] = []
         self.ref = None
+        self.ref_frames: list[np.ndarray] = []
         self.phase = "ref"
         self.counter = AUTOCAL_REF_FR
         self.status = "Referans alınıyor (lazer kapalı)…"
@@ -432,9 +619,11 @@ class AutoCalibrator:
     def update(self, small_bgr) -> dict:
         n = len(self.grid)
         if self.phase == "ref":
+            self.ref_frames.append(small_bgr.copy())
             self.counter -= 1
             if self.counter <= 0:
-                self.ref = small_bgr.copy()
+                self.ref = np.median(np.stack(self.ref_frames), axis=0).astype(np.uint8)
+                self.ref_frames.clear()
                 self.phase = "settle"
                 self.counter = AUTOCAL_SETTLE_FR
                 self.dot_samples = []
@@ -468,10 +657,18 @@ class AutoCalibrator:
 
             summary, err = _summarize_dot_samples(self.dot_samples)
             if summary is not None:
-                self.samples.append((p, t, summary[0], summary[1]))
+                self.samples.append({
+                    "pan": round(float(p), 4),
+                    "tilt": round(float(t), 4),
+                    "px": round(float(summary["px"]), 3),
+                    "py": round(float(summary["py"]), 3),
+                    "jitter_px": round(float(summary["jitter_px"]), 3),
+                    "weight": round(float(summary["weight"]), 3),
+                })
                 log(f"[OTO-KAL] {self.i + 1}/{n}: pan={p:.0f}° tilt={t:.0f}° "
-                    f"-> lazer px=({summary[0]:.1f},{summary[1]:.1f}) alan={summary[2]:.1f} "
-                    f"obs={len(self.dot_samples)}")
+                    f"-> lazer px=({summary['px']:.1f},{summary['py']:.1f}) "
+                    f"alan={summary['area']:.1f} jitter={summary['jitter_px']:.1f}px "
+                    f"w={summary['weight']:.2f} obs={len(self.dot_samples)}")
             else:
                 reason = err or "bilinmeyen hata"
                 seen = len(self.dot_samples)
@@ -537,10 +734,18 @@ calib_click_px: tuple[float, float] | None = None
 auto_cal_active: bool = False          # web handler bunu set eder, main loop yakalar
 auto_cal_status: str = ""              # otomatik kalibrasyon ilerleme mesajı (UI için)
 
-# Piksel→servo açısı haritası (otomatik kalibrasyondan; ikinci derece polinom katsayıları)
+# 5-nokta manuel kalibrasyon durumu
+manual5_active: bool = False
+manual5_step: int = 0
+manual5_clicks: list = []             # {"pan", "tilt", "px", "py", "weight"} listesi
+
+# Otomatik kalibrasyon: ağırlıklı örnek tablosu + linear/quadratic kalite modeli
 HAS_PIXEL_MAP: bool = False
-MAP_PAN_COEF = None                    # np.ndarray (6,) — [1, px, py, px², py², px·py]
+MAP_MODEL_TYPE: str | None = None
+MAP_PAN_COEF = None
 MAP_TILT_COEF = None
+CALIBRATION_SAMPLES: list[dict] = []
+REACHABLE_HULL = None
 
 # Web handler'ların thread-safe okuyabileceği durum snapshot'ı
 web_status: dict = {}
@@ -1067,19 +1272,35 @@ input[type=number]{background:#1a1a1a;color:#ddd;border:1px solid #333;padding:6
     Sistem servoları otomatik gezdirir, <b>kırmızı lazer noktasını kendisi bulur</b> ve
     piksel→servo haritasını çıkarır. Tek yapman gereken:<br>
     1. Lazerin vurduğu bölgeye düz bir yüzey (duvar/karton) koy — tarama menzilini görsün<br>
-    2. Aşağıdaki butona bas, stream'de yeşil noktalar birikirken bekle (~20 sn)
+    2. Aşağıdaki butona bas, stream'de yeşil noktalar birikirken bekle (~45 sn)
   </div>
   <button class="btn btn-ok" style="margin-top:10px" onclick="startAutoCalib()">⚡ Otomatik Kalibrasyonu Başlat</button>
   <div id="auto-status" style="margin-top:10px;font-size:13px;color:#7ab">Hazır.</div>
 </div>
 
-<div class="card">
-  <h3>Manuel Kalibrasyon (alternatif)</h3>
+<div class="card" style="border-color:#1a3a4a">
+  <h3>🔷 5-Nokta Manuel Kalibrasyon</h3>
   <div class="steps">
-    1. Kalibrasyonu Başlat → otomatik kalibrasyon varsa durur, sistem home konumuna gider, lazer açılır<br>
+    Servolar 5 farklı pozisyona hareket eder; her seferinde stream'de lazer noktasına tıkla.<br>
+    Sıra: <b>Merkez → Pan Sol → Pan Sağ → Tilt Yukarı → Tilt Aşağı</b> (toplam ~20 sn)<br>
+    Piksel→servo doğrusal haritası çıkarılır. Otomatik kalibrasyon mümkün değilse kullan.
+  </div>
+  <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-ok" onclick="startM5()">▶ Başlat</button>
+    <button class="btn btn-danger" onclick="cancelM5()">✕ İptal</button>
+    <button class="btn btn-ok" id="m5-confirm-btn" style="display:none" onclick="confirmM5()">✓ Onayla ve Kaydet</button>
+  </div>
+  <div id="m5-step-info" style="margin-top:10px;font-size:13px;color:#7ab">Başlatılmadı.</div>
+  <div id="m5-result" style="font-size:12px;color:#555;margin-top:4px"></div>
+</div>
+
+<div class="card">
+  <h3>Manuel Tek-Nokta (yalnızca offset)</h3>
+  <div class="steps">
+    1. Kalibrasyonu Başlat → sistem home konumuna gider, lazer açılır<br>
     2. Hedefi <b>~150 cm</b> mesafeye koy (kağıt yüzeye lazer noktasını düşür)<br>
     3. Aşağıdaki stream'de <b>lazer noktasının tam merkezine</b> tıkla<br>
-    4. Mesafeyi gir → Onayla ve Kaydet
+    4. Mesafeyi gir → Onayla ve Kaydet (yalnızca merkez offset öğrenir, ölçek sabit)
   </div>
 </div>
 
@@ -1112,7 +1333,52 @@ input[type=number]{background:#1a1a1a;color:#ddd;border:1px solid #333;padding:6
 <script>
 document.getElementById('nav-cal').classList.add('active')
 let clickX=null,clickY=null
+let m5Active=false,m5Step=0
+const M5_TOTAL=5
+const M5_LABELS=['Merkez','Pan Sol','Pan Sağ','Tilt Yukarı','Tilt Aşağı']
 
+function updateM5UI(){
+  const si=document.getElementById('m5-step-info')
+  const cb=document.getElementById('m5-confirm-btn')
+  if(m5Active&&m5Step<M5_TOTAL){
+    si.textContent='Adım '+(m5Step+1)+'/'+M5_TOTAL+': '+M5_LABELS[m5Step]+' — servo hareket etti, lazer noktasına tıkla'
+    cb.style.display='none'
+  }else if(m5Active&&m5Step>=M5_TOTAL){
+    si.textContent='Tüm '+M5_TOTAL+' nokta toplandı — "Onayla ve Kaydet" düğmesine bas'
+    cb.style.display='inline-block'
+  }else{
+    si.textContent='Başlatılmadı.'
+    cb.style.display='none'
+  }
+}
+function startM5(){
+  fetch('/calibrate/manual5/start',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.status==='error'){document.getElementById('m5-result').textContent='Hata: '+d.msg;return}
+    m5Active=true;m5Step=0
+    document.getElementById('m5-result').textContent=''
+    updateM5UI()
+  })
+}
+function cancelM5(){
+  fetch('/calibrate/manual5/cancel',{method:'POST'}).then(()=>{
+    m5Active=false;updateM5UI()
+    document.getElementById('m5-result').textContent='İptal edildi.'
+    refreshStatus()
+  })
+}
+function confirmM5(){
+  fetch('/calibrate/manual5/confirm',{method:'POST'}).then(r=>r.json()).then(d=>{
+    m5Active=false;updateM5UI()
+    const el=document.getElementById('m5-result')
+    if(d.status==='calibrated')
+      el.textContent='✓ Kaydedildi: rms='+d.rms_pan.toFixed(2)+'°/'+d.rms_tilt.toFixed(2)+'° reproj='+d.reproj.toFixed(1)+'px'
+    else if(d.status==='warning')
+      el.textContent='⚠ '+d.msg
+    else
+      el.textContent='Hata: '+(d.msg||'bilinmeyen')
+    refreshStatus()
+  })
+}
 function startCalib(){
   fetch('/calibrate/start',{method:'POST'}).then(r=>r.json()).then(()=>{
     document.getElementById('info').textContent="Lazer açık. Sistem home konumunda; stream'de lazer noktasına tıklayın."
@@ -1122,8 +1388,18 @@ function startCalib(){
 function onStreamClick(e){
   const img=document.getElementById('stream')
   const r=img.getBoundingClientRect()
-  clickX=Math.round((e.clientX-r.left)*(img.naturalWidth/r.width))
-  clickY=Math.round((e.clientY-r.top)*(img.naturalHeight/r.height))
+  const rx=Math.round((e.clientX-r.left)*(img.naturalWidth/r.width))
+  const ry=Math.round((e.clientY-r.top)*(img.naturalHeight/r.height))
+  if(m5Active&&m5Step<M5_TOTAL){
+    fetch('/calibrate/manual5/click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:rx,y:ry})})
+    .then(res=>res.json()).then(d=>{
+      if(d.status==='next_step'){m5Step++;updateM5UI()}
+      else if(d.status==='all_done'){m5Step=M5_TOTAL;updateM5UI()}
+      else if(d.status==='error')document.getElementById('m5-result').textContent='Hata: '+d.msg
+    })
+    return
+  }
+  clickX=rx;clickY=ry
   const m=document.getElementById('marker')
   m.style.left=(e.clientX-r.left)+'px';m.style.top=(e.clientY-r.top)+'px';m.style.display='block'
   document.getElementById('info').textContent='Seçilen: ('+clickX+', '+clickY+') px — Onayla ya da farklı noktaya tıkla.'
@@ -1157,8 +1433,10 @@ function startAutoCalib(){
 function refreshStatus(){
   fetch('/calibrate/status').then(r=>r.json()).then(d=>{
     const ox=(d.laser_offset_px_x||0).toFixed(2),oy=(d.laser_offset_px_y||0).toFixed(2)
+    const m5=d.manual5_calibration?'5-nokta':'oto'
     document.getElementById('cal-status').innerHTML=
-      (d.has_pixel_map?'✓ Piksel→servo haritası AKTİF':'Piksel haritası yok')
+      (d.has_pixel_map?'✓ Piksel→servo haritası AKTİF ('+m5+')':'Piksel haritası yok')
+      +'<br>model: '+(d.model_type||'—')
       +'<br>'+(d.has_calibration_file?'dosya: var':'dosya: yok')
       +'<br>offset_px: ('+ox+', '+oy+')'
     const a=document.getElementById('auto-status')
@@ -1231,14 +1509,27 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                     snapshot = dict(web_status)
                 self._json_ok(snapshot)
             elif self.path == "/calibrate/status":
+                m5_flag = False
+                if os.path.exists(CALIB_PATH):
+                    try:
+                        with open(CALIB_PATH) as _f:
+                            m5_flag = bool(_json.load(_f).get("manual5_calibration", False))
+                    except Exception:
+                        pass
                 self._json_ok({
                     "laser_offset_px_x":  LASER_OFFSET_PX_X,
                     "laser_offset_px_y":  LASER_OFFSET_PX_Y,
                     "calibrating":        calibrating,
                     "has_calibration_file": os.path.exists(CALIB_PATH),
                     "has_pixel_map":      HAS_PIXEL_MAP,
+                    "model_type":        MAP_MODEL_TYPE,
+                    "manual5_calibration": m5_flag,
+                    "reachable_hull":    (REACHABLE_HULL.tolist()
+                                           if REACHABLE_HULL is not None else []),
                     "auto_cal_active":    auto_cal_active,
                     "auto_cal_status":    auto_cal_status,
+                    "manual5_active":    manual5_active,
+                    "manual5_step":      manual5_step,
                 })
             else:
                 self.send_error(404)
@@ -1249,6 +1540,7 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
             global auto_cal_active, auto_cal_status
             global target_pan_deg, target_tilt_deg
             global sim_laser_on
+            global manual5_active, manual5_step, manual5_clicks
 
             if self.path == "/laser/off":
                 with data_lock:
@@ -1368,6 +1660,126 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 log("[OTO-KALİBRASYON] Web'den başlatıldı.")
                 self._json_ok({"status": "auto_calibrating"})
 
+            elif self.path == "/calibrate/manual5/start":
+                if auto_cal_active:
+                    self._json_ok({"status": "error", "msg": "Önce otomatik kalibrasyonu iptal et"})
+                    return
+                positions = _manual5_positions()
+                p0, t0 = positions[0]
+                with data_lock:
+                    calibrating      = True
+                    calib_click_px   = None
+                    auto_cal_active  = False
+                    manual5_active   = True
+                    manual5_step     = 0
+                    manual5_clicks   = []
+                    current_target_id = None
+                    target_pan_deg   = p0
+                    target_tilt_deg  = t0
+                    sim_laser_on     = True
+                if HAS_GPIO and lazer:
+                    lazer.on()
+                log(f"[5-NOKTA KAL] Başlatıldı. Adım 1/5: {MANUAL5_LABELS[0]} "
+                    f"pan={p0:.1f}° tilt={t0:.1f}°")
+                self._json_ok({"status": "manual5_started", "step": 0,
+                               "label": MANUAL5_LABELS[0]})
+
+            elif self.path == "/calibrate/manual5/click":
+                if not manual5_active:
+                    self._json_ok({"status": "error", "msg": "5-nokta kalibrasyon aktif değil"})
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                body = _json.loads(self.rfile.read(length))
+                cx = float(body["x"]) * (PROCESS_W / CAPTURE_W)
+                cy = float(body["y"]) * (PROCESS_H / CAPTURE_H)
+                positions = _manual5_positions()
+                with data_lock:
+                    step = manual5_step
+                    if step >= len(positions):
+                        self._json_ok({"status": "error", "msg": "Zaten tüm noktalar toplandı"})
+                        return
+                    p, t = positions[step]
+                    manual5_clicks.append({
+                        "pan":    round(p, 4),
+                        "tilt":   round(t, 4),
+                        "px":     round(cx, 3),
+                        "py":     round(cy, 3),
+                        "weight": 1.0,
+                    })
+                    manual5_step += 1
+                    new_step = manual5_step
+                    if new_step < len(positions):
+                        np_, nt = positions[new_step]
+                        target_pan_deg  = np_
+                        target_tilt_deg = nt
+                log(f"[5-NOKTA KAL] Adım {step+1}/5 kaydedildi: "
+                    f"pan={p:.1f}° tilt={t:.1f}° px=({cx:.1f},{cy:.1f})")
+                if new_step < len(positions):
+                    log(f"[5-NOKTA KAL] Adım {new_step+1}/5: {MANUAL5_LABELS[new_step]} "
+                        f"pan={positions[new_step][0]:.1f}° tilt={positions[new_step][1]:.1f}°")
+                    self._json_ok({"status": "next_step", "step": new_step,
+                                   "label": MANUAL5_LABELS[new_step]})
+                else:
+                    self._json_ok({"status": "all_done", "step": new_step})
+
+            elif self.path == "/calibrate/manual5/confirm":
+                if not manual5_active:
+                    self._json_ok({"status": "error", "msg": "5-nokta kalibrasyon aktif değil"})
+                    return
+                with data_lock:
+                    clicks = list(manual5_clicks)
+                    step = manual5_step
+                if step < len(_manual5_positions()):
+                    self._json_ok({"status": "error",
+                                   "msg": f"Sadece {step}/5 nokta tıklandı"})
+                    return
+                with data_lock:
+                    manual5_active  = False
+                    calibrating     = False
+                    sim_laser_on    = False
+                    target_pan_deg  = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                result = _fit_pixel_to_servo(clicks)
+                if result is None:
+                    self._json_ok({"status": "error",
+                                   "msg": "Fit oluşturulamadı — en az 3 nokta gerekli"})
+                    return
+                _save_pixel_map(result, manual5=True)
+                usable, reason = _is_pixel_map_usable(result)
+                if usable:
+                    self._json_ok({
+                        "status":    "calibrated",
+                        "model_type": result["model_type"],
+                        "rms_pan":   result["rms_pan_deg"],
+                        "rms_tilt":  result["rms_tilt_deg"],
+                        "reproj":    result["reprojection_error_px"],
+                    })
+                else:
+                    self._json_ok({
+                        "status": "warning",
+                        "msg": f"Kaydedildi ama kalite düşük: {reason}",
+                        "model_type": result["model_type"],
+                        "rms_pan":   result["rms_pan_deg"],
+                        "rms_tilt":  result["rms_tilt_deg"],
+                        "reproj":    result["reprojection_error_px"],
+                    })
+
+            elif self.path == "/calibrate/manual5/cancel":
+                with data_lock:
+                    manual5_active  = False
+                    manual5_step    = 0
+                    manual5_clicks  = []
+                    calibrating     = False
+                    sim_laser_on    = False
+                    target_pan_deg  = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                log("[5-NOKTA KAL] İptal edildi.")
+                self._json_ok({"status": "cancelled"})
+
             else:
                 self.send_error(404)
     return H
@@ -1425,6 +1837,19 @@ def smooth_move(pan_to: float, tilt_to: float,
             time.sleep(step_delay)
 
 
+def backlash_compensated_move(pan_to: float, tilt_to: float) -> None:
+    """Final yaklaşımı her iki eksende de düşük açı yönünden gerçekleştirir."""
+    pan_to = max(PAN_MIN_DEG, min(PAN_MAX_DEG, pan_to))
+    tilt_to = max(TILT_MIN_DEG, min(TILT_MAX_DEG, tilt_to))
+    pan_changes = abs(pan_to - current_pan_deg) > 0.05
+    tilt_changes = abs(tilt_to - current_tilt_deg) > 0.05
+    pre_pan = max(PAN_MIN_DEG, pan_to - BACKLASH_APPROACH_PAN_DEG) if pan_changes else pan_to
+    pre_tilt = max(TILT_MIN_DEG, tilt_to - BACKLASH_APPROACH_TILT_DEG) if tilt_changes else tilt_to
+    pre_steps = max(1, round(SERVO_MOVE_STEPS * BACKLASH_PREMOVE_DURATION / SERVO_MOVE_DURATION))
+    smooth_move(pre_pan, pre_tilt, duration=BACKLASH_PREMOVE_DURATION, steps=pre_steps)
+    smooth_move(pan_to, tilt_to)
+
+
 def motor_smooth_thread():
     """Ana döngüden bağımsız olarak en güncel hedefe eased hareket uygular."""
     global target_pan_deg, target_tilt_deg, current_pan_deg, current_tilt_deg, is_running
@@ -1446,8 +1871,8 @@ def motor_smooth_thread():
         pan_moving = abs(t_pan - current_pan_deg) > 0.05
         tilt_moving = abs(t_tilt - current_tilt_deg) > 0.05
         if pan_moving or tilt_moving:
-            smooth_move(t_pan, t_tilt)
-            # smooth_move iki servoya da açı yazar; ikisini de sonraki turda detach et.
+            backlash_compensated_move(t_pan, t_tilt)
+            # Hareket fonksiyonu iki servoya da açı yazar; sonraki turda detach edilir.
             pan_active = True
             tilt_active = True
             continue
@@ -1516,7 +1941,12 @@ def main(argv=None) -> None:
         if not HAS_PICAMERA2:
             raise RuntimeError("Picamera2 kullanılamıyor. Dry-run için --dry-run kullan.")
         picam2 = Picamera2()
-    cam_controls = {"FrameRate": TARGET_FPS}
+    # Kalibrasyon tekrarlanabilirliği için beyaz dengesi sabit; pozlama da aşağıda sabitlenir.
+    cam_controls = {
+        "FrameRate": TARGET_FPS,
+        "AwbEnable": False,
+        "ColourGains": (1.0, 1.0),
+    }
     if EXPOSURE_TIME_US > 0:
         cam_controls["AeEnable"] = False
         cam_controls["ExposureTime"] = EXPOSURE_TIME_US
@@ -1619,8 +2049,12 @@ def main(argv=None) -> None:
                                        (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
                     for (px, py, _a) in auto_cal.dot_samples:
                         cv2.circle(overlay, (int(px * sx), int(py * sy)), 2, (0, 180, 255), -1)
-                    for (_p, _t, px, py) in auto_cal.samples:
-                        cv2.circle(overlay, (int(px * sx), int(py * sy)), 3, (0, 255, 0), -1)
+                    for sample in auto_cal.samples:
+                        cv2.circle(
+                            overlay,
+                            (int(sample["px"] * sx), int(sample["py"] * sy)),
+                            3, (0, 255, 0), -1,
+                        )
                     cv2.putText(overlay, "OTO-KALIBRASYON: " + cmd["status"], (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
                     ok, jpg = cv2.imencode(".jpg", overlay, encode)
@@ -1632,8 +2066,11 @@ def main(argv=None) -> None:
                     usable, reason = _is_pixel_map_usable(res)
                     if usable:
                         _save_pixel_map(res)
-                        auto_cal_status = (f"Tamamlandı — {res['n_samples']} nokta, "
-                                           f"rms {res['rms_pan_deg']}/{res['rms_tilt_deg']}°")
+                        auto_cal_status = (
+                            f"Tamamlandı — {res['model_type']}, {res['n_samples']} nokta, "
+                            f"rms {res['rms_pan_deg']}/{res['rms_tilt_deg']}°, "
+                            f"reproj {res['reprojection_error_px']}px"
+                        )
                     else:
                         auto_cal_status = f"BAŞARISIZ — {reason}"
                         log(f"[OTO-KALİBRASYON] Başarısız: {reason}.")
@@ -1657,9 +2094,16 @@ def main(argv=None) -> None:
                 overlay = frame.copy()
                 cv2.drawMarker(overlay, (CAPTURE_W // 2, CAPTURE_H // 2),
                                (0, 255, 255), cv2.MARKER_CROSS, 40, 2)
-                cv2.putText(overlay, "KALIBRASYON — Lazer noktasina tiklayin",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            (0, 255, 255), 2, cv2.LINE_AA)
+                if manual5_active:
+                    step5 = manual5_step
+                    label5 = MANUAL5_LABELS[step5] if step5 < len(MANUAL5_LABELS) else "Tamamlandı"
+                    msg5 = f"5-NOKTA KAL [{step5+1 if step5 < 5 else 5}/5]: {label5} — lazer noktasina tikla"
+                    cv2.putText(overlay, msg5, (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(overlay, "KALIBRASYON — Lazer noktasina tiklayin",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 255, 255), 2, cv2.LINE_AA)
                 with data_lock:
                     click = calib_click_px
                 if click is not None:
@@ -1772,6 +2216,7 @@ def main(argv=None) -> None:
             aim_error_x = None
             aim_error_y = None
             target_misses = None
+            target_reachable = False
 
             # ADIM 1: Eğer halihazırda kilitli bir hedefimiz varsa onu takip et.
             # Track coast ediyor olsa bile (misses>0, henüz MAX_MISSED'a ulaşmadı)
@@ -1782,7 +2227,20 @@ def main(argv=None) -> None:
                     target_still_visible = True
                     target_misses = tr.misses
                     if tr.misses == 0:
-                        lock_visible_time += dt
+                        target_reachable = not HAS_PIXEL_MAP or is_reachable_pixel(tr.cx, tr.cy)
+                        if target_reachable:
+                            lock_visible_time += dt
+                            if HAS_GPIO and lazer:
+                                lazer.on()
+                            sim_laser_on = True
+                        else:
+                            if HAS_GPIO and lazer:
+                                lazer.off()
+                            sim_laser_on = False
+                    else:
+                        if HAS_GPIO and lazer:
+                            lazer.off()
+                        sim_laser_on = False
 
                     if lock_visible_time >= 3.0:
                         # 3 saniye kesintisiz vurduk, sinek imha edildi!
@@ -1799,16 +2257,15 @@ def main(argv=None) -> None:
                         if HAS_GPIO and pan_servo and tilt_servo:
                             pan_servo.detach()
                             tilt_servo.detach()
-                    elif tr.misses == 0 and HAS_PIXEL_MAP:
-                        # Doğru yöntem (sabit kamera): piksel→servo haritasıyla doğrudan nişan al.
-                        # Lazeri sineğin pikseline götürecek mutlak açıyı hesapla.
+                    elif tr.misses == 0 and HAS_PIXEL_MAP and target_reachable:
+                        # Yalnızca kalibre edilmiş convex hull içinde yerel enterpolasyon yap.
                         aim_error_x = float(tr.cx - PROCESS_W / 2)
                         aim_error_y = float(tr.cy - PROCESS_H / 2)
                         want_pan, want_tilt = pixel_to_servo(tr.cx, tr.cy)
                         with data_lock:
                             target_pan_deg  = max(PAN_MIN_DEG,  min(PAN_MAX_DEG,  want_pan))
                             target_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG, want_tilt))
-                    elif tr.misses == 0:
+                    elif tr.misses == 0 and not HAS_PIXEL_MAP:
                         # Harita yoksa eski oransal mod (sabit kamerada geometrik olarak hatalı,
                         # sadece geriye dönük uyumluluk için — otomatik kalibrasyon önerilir).
                         error_x = tr.cx - (PROCESS_W / 2 + LASER_OFFSET_PX_X)
@@ -1825,7 +2282,10 @@ def main(argv=None) -> None:
 
                     if tr.misses == 0 and now - last_lock_log >= 1.0:
                         last_lock_log = now
-                        if aim_error_x is not None and aim_error_y is not None:
+                        if HAS_PIXEL_MAP and not target_reachable:
+                            log(f"[LOCK] id={tr.track_id} reachable alan dışında — "
+                                "servo ve lazer beklemede.")
+                        elif aim_error_x is not None and aim_error_y is not None:
                             log(f"[LOCK] id={tr.track_id} vis={lock_visible_time:.1f}s "
                                 f"err=({aim_error_x:.1f},{aim_error_y:.1f})px "
                                 f"mode={'map' if HAS_PIXEL_MAP else 'offset'}")
@@ -1848,7 +2308,8 @@ def main(argv=None) -> None:
             if current_target_id is None:
                 candidates = [
                     tr for tr in confirmed
-                    if tr.track_id not in killed_flies
+                    if (tr.track_id not in killed_flies
+                        and (not HAS_PIXEL_MAP or is_reachable_pixel(tr.cx, tr.cy)))
                 ]
                 if candidates:
                     best = max(candidates, key=candidate_score)
@@ -1857,6 +2318,7 @@ def main(argv=None) -> None:
                     lock_start_time = now
                     lock_visible_time = 0.0
                     target_still_visible = True  # Aynı frame içerisinde hedef kaçtı kontrolüne düşmemesi için
+                    target_reachable = True
                     if HAS_GPIO and lazer:
                         lazer.on()
                     sim_laser_on = True
@@ -1882,6 +2344,7 @@ def main(argv=None) -> None:
                     "dry_run": dry_run,
                     "suppressed": suppressed,
                     "target_misses": target_misses,
+                    "target_reachable": target_reachable,
                     "lock_visible_s": round(lock_visible_time, 2),
                     "aim_error_x": round(aim_error_x, 1) if aim_error_x is not None else None,
                     "aim_error_y": round(aim_error_y, 1) if aim_error_y is not None else None,
@@ -1901,6 +2364,17 @@ def main(argv=None) -> None:
             # =========================================================================
             # Orijinal Çizim ve Görüntü Katmanı (Overlay)
             # =========================================================================
+            if HAS_PIXEL_MAP and REACHABLE_HULL is not None:
+                hull_display = np.array(
+                    [[int(x * sx), int(y * sy)] for x, y in REACHABLE_HULL],
+                    dtype=np.int32,
+                ).reshape(-1, 1, 2)
+                cv2.polylines(frame, [hull_display], True, (0, 255, 0), 2, cv2.LINE_AA)
+                hx, hy = hull_display[0, 0]
+                cv2.putText(frame, "reachable", (int(hx) + 4, int(hy) - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (0, 255, 0), 1, cv2.LINE_AA)
+
             for (x1, y1, x2, y2) in exclusion_zones:
                 fx1, fy1 = int(x1 * sx), int(y1 * sy)
                 fx2, fy2 = int(x2 * sx), int(y2 * sy)
