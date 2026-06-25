@@ -3,8 +3,16 @@ Ok tuşlu manuel servo testi — pan/tilt'i ok tuşlarıyla sürer ve canlı pul
 genişliğini (µs) gösterir. Servonun nerede zorlandığını gözle görmek için
 mekanik aralık geniş tutuldu (CLAUDE.md doğrulanmış: pan ±45°, tilt 0–75°).
 
-ÖNEMLİ: Çalıştırmadan önce turret.service'i durdur (aynı GPIO çakışması olmasın):
-    sudo systemctl stop turret.service
+Bu sürüm RP1 DONANIM PWM kullanır (new2.py ile aynı): GPIO12=PWM0(ch0)=pan,
+GPIO13=PWM1(ch1)=tilt. Jitter'sız darbe verir.
+
+ÖN KOŞULLAR:
+  1. config.txt overlay aktif olmalı (reboot sonrası):
+       dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+     Overlay yoksa pinler PWM'e bağlı değildir; servo fiziksel olarak oynamaz.
+  2. /sys/class/pwm yazma izni (udev kuralı + gpio grubu).
+  3. turret.service DURDURULMUŞ olmalı (aynı PWM kanalını ikisi birden açmasın):
+       sudo systemctl stop turret.service
 
 Kontroller:
     ← / →   Pan (sol / sağ)
@@ -12,25 +20,27 @@ Kontroller:
     + / -   Adım büyüklüğü (derece) artır/azalt
     p / t   pan / tilt'i mekanik limite kadar otomatik tara (yavaş)
     c       Merkeze / alt limite dön
-    q       Çıkış (servoları detach eder)
+    q       Çıkış (PWM'i durdurur)
 """
 
-import os
-os.environ["GPIOZERO_PIN_FACTORY"] = "lgpio"
-
-from gpiozero import Servo
 import sys
 import tty
 import termios
 import threading
 import time
 
+from rpi_hardware_pwm import HardwarePWM
+
 # --- Servo pulse aralığı (new2.py / manual-control5.py ile aynı) ---
 MIN_PW = 0.0005  # 0.5 ms
 MAX_PW = 0.0025  # 2.5 ms
 
-pan_servo  = Servo(12, min_pulse_width=MIN_PW, max_pulse_width=MAX_PW)
-tilt_servo = Servo(13, min_pulse_width=MIN_PW, max_pulse_width=MAX_PW)
+# --- Donanım PWM kanal eşlemesi (new2.py ile aynı) ---
+# Eksenler ters/çalışmıyorsa yalnız bu iki sabiti takas et (veya 2/3 dene).
+PWM_CHIP = 0             # kernel 6.12+ tüm modellerde pwmchip0
+PAN_PWM_CHANNEL = 0      # GPIO12 = PWM0
+TILT_PWM_CHANNEL = 1     # GPIO13 = PWM1
+PWM_FREQ_HZ = 50         # 20 ms periyot
 
 # --- Test için GENİŞ aralık: gerçek mekanik sınırı kendin bul ---
 # CLAUDE.md "doğrulanmış donanım gerçekleri": pan -45..45, tilt 0..75
@@ -49,6 +59,49 @@ is_running = True
 data_lock = threading.Lock()
 
 
+class HardwarePWMServo:
+    """RP1 donanım PWM'iyle servo sürer. `.value` (-1..1) setter ve `.detach()`
+    arayüzü, eski gpiozero Servo kullanımıyla bire bir uyumludur."""
+
+    def __init__(self, channel: int, chip: int = PWM_CHIP,
+                 min_pw_s: float = MIN_PW, max_pw_s: float = MAX_PW,
+                 freq_hz: int = PWM_FREQ_HZ) -> None:
+        self.period_us = 1_000_000.0 / freq_hz
+        self.min_pw_us = min_pw_s * 1e6
+        self.max_pw_us = max_pw_s * 1e6
+        self.pwm = HardwarePWM(pwm_channel=channel, hz=freq_hz, chip=chip)
+        self._started = False
+        self._value: float | None = None
+
+    def _duty_for_value(self, v: float) -> float:
+        v = max(-1.0, min(1.0, v))
+        pw_us = self.min_pw_us + (v + 1.0) / 2.0 * (self.max_pw_us - self.min_pw_us)
+        return pw_us / self.period_us * 100.0
+
+    @property
+    def value(self) -> float | None:
+        return self._value
+
+    @value.setter
+    def value(self, v: float) -> None:
+        duty = self._duty_for_value(v)
+        if not self._started:
+            self.pwm.start(duty)
+            self._started = True
+        else:
+            self.pwm.change_duty_cycle(duty)
+        self._value = v
+
+    def detach(self) -> None:
+        if self._started:
+            self.pwm.stop()
+            self._started = False
+
+
+pan_servo = HardwarePWMServo(PAN_PWM_CHANNEL)
+tilt_servo = HardwarePWMServo(TILT_PWM_CHANNEL)
+
+
 def pan_to_servo_val(deg: float) -> float:
     return deg / 90.0
 
@@ -58,7 +111,7 @@ def tilt_to_servo_val(deg: float) -> float:
 
 
 def servo_val_to_pw_us(v: float) -> float:
-    """gpiozero Servo value (-1..1) -> pulse genişliği (mikrosaniye)."""
+    """Servo value (-1..1) -> pulse genişliği (mikrosaniye)."""
     v = max(-1.0, min(1.0, v))
     pw = MIN_PW + (v + 1.0) / 2.0 * (MAX_PW - MIN_PW)
     return pw * 1e6
@@ -136,11 +189,12 @@ def main() -> None:
     t = threading.Thread(target=motor_smooth_thread, daemon=True)
     t.start()
 
-    print("=== Ok Tuslu Manuel Servo Testi ===")
+    print("=== Ok Tuslu Manuel Servo Testi (DONANIM PWM) ===")
     print("< / > Pan  |  ^ / v Tilt  |  +/- adim  |  p pan-tara  t tilt-tara  |  c merkez  |  q cik")
     print(f"Aralik  Pan: {PAN_MIN_DEG:+.0f}..{PAN_MAX_DEG:+.0f}°   "
           f"Tilt: {TILT_MIN_DEG:.0f}..{TILT_MAX_DEG:.0f}°   "
-          f"(pulse {MIN_PW*1000:.1f}-{MAX_PW*1000:.1f} ms)")
+          f"(pulse {MIN_PW*1000:.1f}-{MAX_PW*1000:.1f} ms, "
+          f"pwmchip{PWM_CHIP} ch{PAN_PWM_CHANNEL}/{TILT_PWM_CHANNEL})")
     print("Servo bir noktada vinliyor/titriyorsa orasi mekanik limittir — not al.")
     print("-" * 70)
     print_status()
@@ -180,7 +234,7 @@ def main() -> None:
         time.sleep(0.05)
         pan_servo.detach()
         tilt_servo.detach()
-        print("\nServolar detach edildi, guvenli cikis.")
+        print("\nPWM durduruldu, guvenli cikis.")
 
 
 if __name__ == "__main__":
