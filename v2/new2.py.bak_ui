@@ -613,7 +613,7 @@ def _save_pixel_map(result: dict, manual5: bool = False,
 
 def _is_pixel_map_usable(result: dict | None) -> tuple[bool, str]:
     if result is None:
-        return False, "fit failed"
+        return False, "fit oluşturulamadı"
     n_samples = int(result.get("n_samples", 0))
     rms_pan = float(result.get("rms_pan_deg", 999.0))
     rms_tilt = float(result.get("rms_tilt_deg", 999.0))
@@ -628,13 +628,13 @@ def _is_pixel_map_usable(result: dict | None) -> tuple[bool, str]:
     else:
         min_samp = AUTOCAL_MIN_SAMPLES
     if n_samples < min_samp:
-        return False, f"too few samples ({n_samples} < {min_samp})"
+        return False, f"çok az örnek ({n_samples} < {min_samp})"
     if px_span_x < min_span_x or px_span_y < min_span_y:
-        return False, (f"sample spread too small "
+        return False, (f"örnek yayılımı yetersiz "
                        f"(span={px_span_x:.0f}x{px_span_y:.0f}px < "
                        f"{min_span_x:.0f}x{min_span_y:.0f}px)")
     if rms_pan > AUTOCAL_MAX_RMS_PAN_DEG or rms_tilt > AUTOCAL_MAX_RMS_TILT_DEG:
-        return False, (f"high RMS error "
+        return False, (f"yüksek RMS hata "
                        f"({rms_pan:.1f}/{rms_tilt:.1f}° > "
                        f"{AUTOCAL_MAX_RMS_PAN_DEG:.1f}/{AUTOCAL_MAX_RMS_TILT_DEG:.1f}°)")
     if reprojection > AUTOCAL_MAX_REPROJECTION_PX:
@@ -683,8 +683,8 @@ class HeliosCalibrator:
                       (0.0, tmin), (0.0, tmax), (0.0, 0.0)]
         self.grid = [(0.0, 0.0), (pmin, 0.0), (pmin, tmax), (0.0, tmax),
                      (pmax, tmax), (pmax, 0.0), (pmax, tmin), (0.0, tmin), (pmin, tmin)]
-        self.labels = ["center", "right", "top-right", "top", "top-left",
-                       "left", "bottom-left", "bottom", "bottom-right"]
+        self.labels = ["orta", "sağ orta", "sağ üst", "üst orta", "sol üst",
+                       "sol orta", "sol alt", "alt orta", "sağ alt"]
         self.sweep_i = 0
         self.i = 0
         self.samples: list[dict] = []
@@ -692,7 +692,7 @@ class HeliosCalibrator:
         self.ref_frames: list = []
         self.phase = "sweep"
         self.counter = HELIOS_SETTLE_FR
-        self.status = "Full sweep (warm-up)…"
+        self.status = "Tam tarama (ısıtma)…"
         self.result = None
         self.dot_samples: list = []
         self.last_dot = None
@@ -784,7 +784,7 @@ class HeliosCalibrator:
             p, t = self.sweep[self.sweep_i]
             if not self._arrived(p, t):
                 return {"pan": p, "tilt": t, "laser": False, "done": False,
-                        "status": self.status + " (moving)"}
+                        "status": self.status + " (gidiyor)"}
             self.counter -= 1
             if self.counter > 0:
                 return {"pan": p, "tilt": t, "laser": False, "done": False, "status": self.status}
@@ -792,12 +792,12 @@ class HeliosCalibrator:
             if self.sweep_i < len(self.sweep):
                 np_, nt = self.sweep[self.sweep_i]
                 self.counter = HELIOS_SETTLE_FR
-                self.status = f"Full sweep {self.sweep_i + 1}/{len(self.sweep)}"
+                self.status = f"Tam tarama {self.sweep_i + 1}/{len(self.sweep)}"
                 return {"pan": np_, "tilt": nt, "laser": False, "done": False, "status": self.status}
             self.phase = "ref"
             self.counter = AUTOCAL_REF_FR
             self.ref_frames = []
-            self.status = "Capturing reference (laser off)…"
+            self.status = "Referans alınıyor (lazer kapalı)…"
             self._log("Tam tarama bitti -> referans alınıyor (lazer kapalı)")
             return {"pan": 0.0, "tilt": 0.0, "laser": False, "done": False, "status": self.status}
 
@@ -811,7 +811,7 @@ class HeliosCalibrator:
                 self.counter = HELIOS_SETTLE_FR
                 self.dot_samples = []
                 p, t = self.grid[self.i]
-                self.status = f"Point 1/{n} ({self.labels[0]})"
+                self.status = f"Nokta 1/{n} ({self.labels[0]})"
                 self._log(f"Referans alındı ({AUTOCAL_REF_FR} frame) -> ölçüm noktaları başlıyor")
                 return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
             return {"pan": 0.0, "tilt": 0.0, "laser": False, "done": False, "status": self.status}
@@ -820,7 +820,7 @@ class HeliosCalibrator:
             p, t = self.grid[self.i]
             if not self._arrived(p, t):
                 return {"pan": p, "tilt": t, "laser": True, "done": False,
-                        "status": self.status + " (moving)"}
+                        "status": self.status + " (gidiyor)"}
             self.counter -= 1
             if self.counter > 0:
                 return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
@@ -829,7 +829,7 @@ class HeliosCalibrator:
             self.dot_samples = []
             self.diag_maxscore = 0
             self.diag_nabove = 0
-            self.status = f"Measuring point {self.i + 1}/{n} ({self.labels[self.i]})"
+            self.status = f"Nokta {self.i + 1}/{n} ({self.labels[self.i]}) ölçülüyor"
             self._log(f"Nokta {self.i + 1}/{n} ({self.labels[self.i]}): VARILDI pan={p:.1f} tilt={t:.1f} -> ölçüm")
             return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
 
@@ -877,13 +877,13 @@ class HeliosCalibrator:
                 else:
                     self._log(f"FIT BAŞARISIZ: tutarlı model çıkmadı ({len(self.samples)} kabul edilen örnek)")
                 return {"laser": False, "done": True,
-                        "status": f"Done — {len(self.samples)}/{n} points",
+                        "status": f"Bitti — {len(self.samples)}/{n} nokta",
                         "result": self.result}
             np_, nt = self.grid[self.i]
             self.phase = "settle"
             self.counter = HELIOS_SETTLE_FR
             self.dot_samples = []
-            self.status = f"Point {self.i + 1}/{n} ({self.labels[self.i]})"
+            self.status = f"Nokta {self.i + 1}/{n} ({self.labels[self.i]})"
             return {"pan": np_, "tilt": nt, "laser": True, "done": False, "status": self.status}
 
         return {"laser": False, "done": True, "status": self.status, "result": self.result}
@@ -1337,8 +1337,9 @@ class FrameBuffer:
 _NAV = """
 <nav>
   <span class="brand">🎯 Turret</span>
-  <a href="/control" id="nav-control">Control</a>
+  <a href="/control" id="nav-control">Kontrol</a>
   <a href="/debug"   id="nav-debug">Debug Mask</a>
+  <a href="/calibrate" id="nav-cal">Kalibrasyon</a>
 </nav>"""
 
 _NAV_CSS = """
@@ -1372,21 +1373,21 @@ DEBUG_PAGE = """<!DOCTYPE html>
 </style></head><body>""" + _NAV + """
 <div class="content">
   <img src="/debug.mjpg"/>
-  <p class="hint">White areas: combined detection mask (motion + dark + adaptive)</p>
+  <p class="hint">Beyaz alan: deteksiyon pipeline birleşik maskesi (hareket + karanlık + adaptif)</p>
 </div>
 <script>document.getElementById('nav-debug').classList.add('active')</script>
 </body></html>"""
 
 CONTROL_PAGE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Turret — Control</title>
+<title>Turret — Kontrol</title>
 <style>
 """ + _NAV_CSS + """
 a{color:#5af;text-decoration:none}
 .layout{flex:1;display:flex;overflow:hidden}
 .stream-panel{flex:1;background:#000;display:flex;align-items:center;justify-content:center;min-width:0}
 .stream-panel img{max-width:100%;max-height:100%;object-fit:contain}
-.sidebar{width:320px;background:#111;border-left:1px solid #222;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:12px;flex-shrink:0}
+.sidebar{width:260px;background:#111;border-left:1px solid #222;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:12px;flex-shrink:0}
 .card{background:#191919;border:1px solid #252525;border-radius:8px;padding:12px}
 .card h3{font-size:10px;font-weight:600;color:#555;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
 .stat{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:13px}
@@ -1401,16 +1402,7 @@ a{color:#5af;text-decoration:none}
 .btn-danger:hover{background:#2a1010}
 .btn-ok{border-color:#1a4a1a;color:#7d7}
 .btn-ok:hover{background:#0f200f}
-.steps{font-size:11px;color:#678;line-height:1.6;margin-bottom:8px}
-.substatus{font-size:12px;color:#9bd;margin-top:8px}
-#cal-status{font-size:12px;color:#888;line-height:1.7}
-.field{display:flex;gap:6px;margin-bottom:8px}
-input[type=text]{flex:1;background:#1a1a1a;color:#ddd;border:1px solid #333;padding:7px 9px;border-radius:5px;font-size:13px;min-width:0}
-.prow{display:flex;align-items:center;gap:6px;padding:7px 0;border-top:1px solid #222}
-.prow .pn{flex:1;font-size:12px;color:#ccc}
-.prow .meta{font-size:10px;color:#666}
-.active-badge{color:#7d7;font-weight:700}
-.btn-inline{display:inline-block;width:auto;margin:0;padding:5px 9px;font-size:11px;text-align:center}
+.calib-info{font-size:11px;color:#555;margin-top:8px}
 </style></head><body>
 """ + _NAV + """
 <div class="layout">
@@ -1418,45 +1410,28 @@ input[type=text]{flex:1;background:#1a1a1a;color:#ddd;border:1px solid #333;padd
   <div class="sidebar">
 
     <div class="card">
-      <h3>System Status</h3>
+      <h3>Sistem Durumu</h3>
       <div class="stat"><span class="stat-label">FPS</span><span class="stat-value" id="s-fps">—</span></div>
       <div class="stat"><span class="stat-label">Tracks</span><span class="stat-value" id="s-trk">—</span></div>
-      <div class="stat"><span class="stat-label">Laser</span><span class="stat-value laser-off" id="s-laz">—</span></div>
-      <div class="stat"><span class="stat-label">Target ID</span><span class="stat-value" id="s-tid">—</span></div>
-      <div class="stat"><span class="stat-label">Kills</span><span class="stat-value" id="s-kld">—</span></div>
+      <div class="stat"><span class="stat-label">Lazer</span><span class="stat-value laser-off" id="s-laz">—</span></div>
+      <div class="stat"><span class="stat-label">Hedef ID</span><span class="stat-value" id="s-tid">—</span></div>
+      <div class="stat"><span class="stat-label">İmha</span><span class="stat-value" id="s-kld">—</span></div>
       <div class="stat"><span class="stat-label">Pan</span><span class="stat-value" id="s-pan">—</span></div>
       <div class="stat"><span class="stat-label">Tilt</span><span class="stat-value" id="s-tlt">—</span></div>
     </div>
 
     <div class="card">
-      <h3>Operations</h3>
-      <button class="btn btn-danger" onclick="post('/laser/off')">⬛ Laser OFF</button>
-      <button class="btn" onclick="post('/laser/on')">🔴 Laser ON (test)</button>
-      <button class="btn" id="static-btn" onclick="toggleStatic()">🎯 Static Test: OFF</button>
-      <button class="btn" onclick="post('/reset')">↺ Reset Targets</button>
+      <h3>Operasyon</h3>
+      <button class="btn btn-danger" onclick="post('/laser/off')">⬛ Lazer KAPAT</button>
+      <button class="btn" onclick="post('/laser/on')">🔴 Lazer AÇ (test)</button>
+      <button class="btn" id="static-btn" onclick="toggleStatic()">🎯 Statik Test: KAPALI</button>
+      <button class="btn" onclick="post('/reset')">↺ Hedef Listesini Sıfırla</button>
     </div>
 
     <div class="card">
-      <h3>Helios Calibration</h3>
-      <div class="steps">Full pan+tilt sweep, then measures the laser at 9 points (center + 8 edges) and fits the pixel→servo map. The camera must see the laser at every point.</div>
-      <button class="btn btn-ok" onclick="startHeliosCalib()">☀️ Start Calibration</button>
-      <button class="btn btn-danger" onclick="cancelHeliosCalib()">✕ Cancel</button>
-      <div class="substatus" id="helios-status">Ready.</div>
-    </div>
-
-    <div class="card">
-      <h3>Current Calibration</h3>
-      <div id="cal-status">Loading…</div>
-    </div>
-
-    <div class="card">
-      <h3>Calibration Profiles</h3>
-      <div class="steps">Save the current calibration under a name; activate any saved one with a click (live, no restart).</div>
-      <div class="field">
-        <input id="profile-name" type="text" placeholder="profile name">
-        <button class="btn btn-ok btn-inline" onclick="saveProfile()">💾 Save</button>
-      </div>
-      <div id="profile-list">Loading…</div>
+      <h3>Kalibrasyon</h3>
+      <a href="/calibrate"><button class="btn btn-ok" style="width:100%">⚙ Kalibrasyon Arayüzü</button></a>
+      <div class="calib-info" id="s-cal">Yükleniyor...</div>
     </div>
 
   </div>
@@ -1464,80 +1439,212 @@ input[type=text]{flex:1;background:#1a1a1a;color:#ddd;border:1px solid #333;padd
 
 <script>
 document.getElementById('nav-control').classList.add('active')
-function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v}
-function post(u){ fetch(u,{method:'POST'}).then(r=>r.json()).catch(()=>{}) }
-function fetchJson(url,options){ return fetch(url,options).then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json() }) }
+function post(u){
+  fetch(u,{method:'POST'})
+    .then(r=>r.json())
+    .then(d=>console.log(d))
+    .catch(err=>{
+      const el=document.getElementById('s-cal')
+      if(el) el.textContent='Kalibrasyon servisine erisilemiyor: '+String(err)
+    })
+}
 function setStaticBtn(on){
-  const b=document.getElementById('static-btn'); if(!b)return
-  b.textContent='🎯 Static Test: '+(on?'ON':'OFF')
+  const b=document.getElementById('static-btn')
+  if(!b) return
+  b.textContent='🎯 Statik Test: '+(on?'AÇIK':'KAPALI')
   b.style.borderColor = on ? '#2a7d46' : ''
 }
-function toggleStatic(){ fetchJson('/detect/static/toggle',{method:'POST'}).then(d=>setStaticBtn(d.active)).catch(()=>{}) }
+function toggleStatic(){
+  fetch('/detect/static/toggle',{method:'POST'}).then(r=>r.json()).then(d=>setStaticBtn(d.active)).catch(()=>{})
+}
+function refresh(){
+  fetch('/status').then(r=>r.json()).then(d=>{
+    document.getElementById('s-fps').textContent = d.fps+' fps'
+    document.getElementById('s-trk').textContent = d.tracks
+    const lEl=document.getElementById('s-laz')
+    if(d.laser){lEl.textContent='AÇIK';lEl.className='stat-value laser-on'}
+    else{lEl.textContent='kapalı';lEl.className='stat-value laser-off'}
+    document.getElementById('s-tid').textContent = (d.target_id===null||d.target_id===undefined)?'—':d.target_id
+    document.getElementById('s-kld').textContent = d.killed
+    document.getElementById('s-pan').textContent = d.pan_deg+'°'
+    document.getElementById('s-tlt').textContent = d.tilt_deg+'°'
+    setStaticBtn(d.static_test_active)
+  }).catch(err=>{
+    document.getElementById('s-fps').textContent='hata'
+    document.getElementById('s-trk').textContent='hata'
+    document.getElementById('s-laz').textContent='offline'
+    document.getElementById('s-tid').textContent='—'
+    document.getElementById('s-kld').textContent='—'
+    document.getElementById('s-pan').textContent='—'
+    document.getElementById('s-tlt').textContent='—'
+    document.getElementById('s-cal').textContent='Servise baglanilamiyor: '+String(err)
+  })
+  fetch('/calibrate/status').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('s-cal')
+    if(d.has_calibration_file){
+      const ox=(d.laser_offset_px_x||0).toFixed(1),oy=(d.laser_offset_px_y||0).toFixed(1)
+      el.textContent='Offset: ('+ox+', '+oy+') px'
+    } else {el.textContent='Kalibrasyon yok — offset=(0,0)'}
+  }).catch(err=>{
+    document.getElementById('s-cal').textContent='Kalibrasyon durumu alinamadi: '+String(err)
+  })
+}
+setInterval(refresh,1000);refresh()
+</script></body></html>"""
+
+CALIBRATE_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Turret — Kalibrasyon</title>
+<style>
+""" + _NAV_CSS + """
+.content{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+.card{background:#191919;border:1px solid #252525;border-radius:8px;padding:14px}
+.card h3{font-size:10px;font-weight:600;color:#555;text-transform:uppercase;letter-spacing:.1em;margin-bottom:10px}
+.steps{color:#7ab;font-size:13px;line-height:2}
+.btn{background:#222;color:#bbb;border:1px solid #333;border-radius:6px;padding:9px 16px;cursor:pointer;font-size:13px;transition:background .15s;margin-right:6px}
+.btn:hover{background:#2c2c2c;color:#fff}
+.btn-ok{border-color:#1a4a1a;color:#7d7}.btn-ok:hover{background:#0f200f}
+.btn-danger{border-color:#5a1515;color:#f77}.btn-danger:hover{background:#2a1010}
+#stream-wrap{position:relative;display:inline-block}
+#stream{max-width:100%;cursor:crosshair;border:2px solid #2a2a2a;border-radius:6px;display:block}
+#marker{position:absolute;width:24px;height:24px;pointer-events:none;border:2px solid #f44;border-radius:50%;display:none;transform:translate(-50%,-50%)}
+#info{font-size:13px;color:#888;min-height:18px}
+#cal-status{font-size:12px;color:#555;white-space:pre;margin-top:8px}
+input[type=number]{background:#1a1a1a;color:#ddd;border:1px solid #333;padding:6px 10px;border-radius:5px;width:90px;font-size:13px}
+</style></head><body>
+""" + _NAV + """
+<div class="content">
+
+<div class="card" style="border-color:#1a3a4a">
+  <h3>☀️ Helios Kalibrasyon</h3>
+  <div class="steps">
+    Önce tam <b>pan + tilt taraması</b> yapar, sonra <b>9 noktada</b> (orta + 8 sınır)
+    lazeri ölçüp piksel→servo haritasını fit eder. Lazeri her noktada kamera görmeli.
+  </div>
+  <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-ok" onclick="startHeliosCalib()">☀️ Başlat</button>
+    <button class="btn btn-danger" onclick="cancelHeliosCalib()">✕ İptal</button>
+  </div>
+  <div id="helios-status" style="margin-top:10px;font-size:13px;color:#bdd">Hazır.</div>
+</div>
+
+<div class="card">
+  <h3>Mevcut Kalibrasyon</h3>
+  <div id="cal-status">Yükleniyor...</div>
+</div>
+
+<div class="card">
+  <h3>📁 Kalibrasyon Profilleri</h3>
+  <div class="steps">Beğendiğin anki kalibrasyonu isimle kaydet; listeden tek tıkla aktif et (canlı, restart gerekmez).</div>
+  <div style="margin-top:10px;display:flex;gap:8px">
+    <input id="profile-name" type="text" placeholder="profil adı" style="flex:1;padding:6px">
+    <button class="btn btn-ok" onclick="saveProfile()">💾 Mevcudu Kaydet</button>
+  </div>
+  <div id="profile-list" style="margin-top:10px">Yükleniyor…</div>
+</div>
+
+</div>
+<script>
+document.getElementById('nav-cal').classList.add('active')
+let clickX=null,clickY=null
+let m5Active=false,m5Step=0
+const M5_TOTAL=5
+const M5_LABELS=['Merkez','Pan Sol','Pan Sağ','Tilt Yukarı','Tilt Aşağı']
+
+function showCalError(msg){
+  document.getElementById('cal-status').textContent=msg
+}
+
+function fetchJson(url, options){
+  return fetch(url, options).then(async r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status)
+    return r.json()
+  })
+}
+
+function setStaticBtn(on){
+  const b=document.getElementById('static-btn')
+  if(!b) return
+  b.textContent='🎯 Statik Test: '+(on?'AÇIK':'KAPALI')
+  b.style.borderColor = on ? '#2a7d46' : ''
+}
+function toggleStatic(){
+  fetchJson('/detect/static/toggle',{method:'POST'}).then(d=>{ setStaticBtn(d.active) }).catch(()=>{})
+}
 function startHeliosCalib(){
-  set('helios-status','Starting… full sweep first.')
+  document.getElementById('helios-status').textContent='Başlatılıyor… önce tam tarama.'
   fetchJson('/calibrate/helios',{method:'POST'}).then(d=>{
-    if(d.status==='already_running') set('helios-status','Already running…')
-    else if(d.status==='error') set('helios-status','Error: '+d.msg)
-    refresh()
-  }).catch(()=>set('helios-status','Error: could not start calibration'))
+    if(d.status==='already_running')
+      document.getElementById('helios-status').textContent='Zaten çalışıyor…'
+    else if(d.status==='error')
+      document.getElementById('helios-status').textContent='Hata: '+d.msg
+    refreshStatus()
+  }).catch(()=>{
+    document.getElementById('helios-status').textContent='Hata: helios kalibrasyon başlatılamadı'
+  })
 }
 function cancelHeliosCalib(){
-  fetchJson('/calibrate/helios/cancel',{method:'POST'}).then(()=>{ set('helios-status','Cancelled.'); refresh() }).catch(()=>{})
+  fetchJson('/calibrate/helios/cancel',{method:'POST'}).then(()=>{
+    document.getElementById('helios-status').textContent='İptal edildi.'
+    refreshStatus()
+  }).catch(()=>{})
+}
+function refreshStatus(){
+  fetchJson('/calibrate/status').then(d=>{
+    const ox=(d.laser_offset_px_x||0).toFixed(2),oy=(d.laser_offset_px_y||0).toFixed(2)
+    const mode=d.calibration_mode||'oto'
+    document.getElementById('cal-status').innerHTML=
+      (d.has_pixel_map?'✓ Piksel→servo haritası AKTİF ('+mode+')':'Piksel haritası yok')
+      +'<br>model: '+(d.model_type||'—')
+      +'<br>'+(d.has_calibration_file?'dosya: var':'dosya: yok')
+      +'<br>offset_px: ('+ox+', '+oy+')'
+    const h=document.getElementById('helios-status')
+    if(h){
+      if(d.helios_cal_active) h.textContent='⏳ '+(d.helios_cal_status||'çalışıyor…')
+      else if(d.helios_cal_status) h.textContent=d.helios_cal_status
+    }
+    setStaticBtn(d.static_test_active)
+  }).catch(err=>{
+    const msg='Kalibrasyon durumu alinamadi. Servis kapali olabilir veya endpoint hata veriyor: '+String(err)
+    showCalError(msg)
+  })
 }
 function saveProfile(){
-  const name=document.getElementById('profile-name').value.trim(); if(!name)return
+  const name=document.getElementById('profile-name').value.trim()
+  if(!name){return}
   fetchJson('/calibrate/profile/save',{method:'POST',body:JSON.stringify({name:name})}).then(d=>{
     if(d.status==='error'){alert(d.msg);return}
-    document.getElementById('profile-name').value=''; loadProfiles()
+    document.getElementById('profile-name').value=''
+    loadProfiles()
   }).catch(()=>{})
 }
 function activateProfile(i){
   const p=window._profiles[i]; if(!p)return
   fetchJson('/calibrate/profile/activate',{method:'POST',body:JSON.stringify({name:p.name})}).then(d=>{
     if(d.status==='error'){alert(d.msg);return}
-    loadProfiles(); refresh()
+    loadProfiles(); refreshStatus()
   }).catch(()=>{})
 }
 function deleteProfile(i){
   const p=window._profiles[i]; if(!p)return
-  if(!confirm('Delete profile "'+p.name+'"?'))return
+  if(!confirm(p.name+' profili silinsin mi?'))return
   fetchJson('/calibrate/profile/delete',{method:'POST',body:JSON.stringify({name:p.name})}).then(()=>loadProfiles()).catch(()=>{})
 }
 function loadProfiles(){
   fetchJson('/calibrate/profiles').then(d=>{
     window._profiles=d.profiles||[]
     const el=document.getElementById('profile-list')
-    if(!window._profiles.length){el.innerHTML='<div style="color:#666;font-size:12px">No saved profiles.</div>';return}
+    if(!window._profiles.length){el.innerHTML='<div style="color:#777;font-size:13px">Kayıtlı profil yok.</div>';return}
     el.innerHTML=window._profiles.map(function(p,i){return ''
-      +'<div class="prow">'
-      +'<div class="pn"><b>'+p.name+'</b>'+(p.active?' <span class="active-badge">● ACTIVE</span>':'')
-      +'<br><span class="meta">'+(p.model_type||'—')+' · n='+(p.n_samples||'—')+' · reproj='+(p.reprojection_error_px||'—')+'px</span></div>'
-      +'<button class="btn btn-ok btn-inline" onclick="activateProfile('+i+')">Activate</button>'
-      +'<button class="btn btn-danger btn-inline" onclick="deleteProfile('+i+')">Delete</button>'
+      +'<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid #222">'
+      +'<div style="flex:1"><b>'+p.name+'</b>'+(p.active?' <span style="color:#2a7d46">● AKTİF</span>':'')
+      +'<br><span style="font-size:11px;color:#888">'+(p.model_type||'—')+' · n='+(p.n_samples||'—')+' · reproj='+(p.reprojection_error_px||'—')+'px · '+(p.calibrated_at||'')+'</span></div>'
+      +'<button class="btn btn-ok" onclick="activateProfile('+i+')">Aktif Et</button>'
+      +'<button class="btn btn-danger" onclick="deleteProfile('+i+')">Sil</button>'
       +'</div>'}).join('')
   }).catch(()=>{})
 }
-function refresh(){
-  fetch('/status').then(r=>r.json()).then(d=>{
-    set('s-fps',d.fps+' fps'); set('s-trk',d.tracks)
-    const lEl=document.getElementById('s-laz')
-    if(d.laser){lEl.textContent='ON';lEl.className='stat-value laser-on'} else {lEl.textContent='off';lEl.className='stat-value laser-off'}
-    set('s-tid',(d.target_id===null||d.target_id===undefined)?'—':d.target_id)
-    set('s-kld',d.killed); set('s-pan',d.pan_deg+'°'); set('s-tlt',d.tilt_deg+'°')
-    setStaticBtn(d.static_test_active)
-  }).catch(()=>{ ['s-fps','s-trk','s-tid','s-kld','s-pan','s-tlt'].forEach(id=>set(id,'—')); set('s-laz','offline') })
-  fetchJson('/calibrate/status').then(d=>{
-    const ox=(d.laser_offset_px_x||0).toFixed(1),oy=(d.laser_offset_px_y||0).toFixed(1)
-    document.getElementById('cal-status').innerHTML=
-      (d.has_pixel_map?'✓ Pixel→servo map ACTIVE':'No pixel map')
-      +'<br>model: '+(d.model_type||'—')
-      +'<br>file: '+(d.has_calibration_file?'yes':'no')
-      +'<br>offset: ('+ox+', '+oy+') px'
-    const h=document.getElementById('helios-status')
-    if(h){ if(d.helios_cal_active) h.textContent='⏳ '+(d.helios_cal_status||'running…'); else if(d.helios_cal_status) h.textContent=d.helios_cal_status }
-  }).catch(()=>{})
-}
-setInterval(refresh,1000); refresh(); loadProfiles()
+refreshStatus();setInterval(refreshStatus,1000);loadProfiles()
 </script></body></html>"""
 
 
@@ -1604,6 +1711,8 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 self._stream(buf_debug)
             elif self.path == "/control":
                 self._send_page(CONTROL_PAGE)
+            elif self.path == "/calibrate":
+                self._send_page(CALIBRATE_PAGE)
             elif self.path == "/status":
                 with data_lock:
                     snapshot = dict(web_status)
@@ -1688,7 +1797,7 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                     target_pan_deg      = PAN_HOME_DEG
                     target_tilt_deg     = TILT_HOME_DEG
                     helios_cal_active   = True
-                    helios_cal_status   = "Starting…"
+                    helios_cal_status   = "Başlatılıyor…"
                     sim_laser_on        = False
                 if HAS_GPIO and lazer:
                     lazer.off()
@@ -2062,7 +2171,7 @@ def main(argv=None) -> None:
                     helios_cal.close("İSTİSNA ile sonlandı")
                     helios_cal = None
                     helios_cal_active = False
-                    helios_cal_status = "Failed — exception (logged)"
+                    helios_cal_status = "BAŞARISIZ — istisna (log'a yazıldı)"
                     ACTIVE_MOVE_DURATION = SERVO_MOVE_DURATION
                     sim_laser_on = False
                     if HAS_GPIO and lazer:
@@ -2093,7 +2202,7 @@ def main(argv=None) -> None:
                         cv2.circle(overlay,
                                    (int(sample["px"] * sx), int(sample["py"] * sy)),
                                    3, (0, 255, 0), -1)
-                    cv2.putText(overlay, "HELIOS-CAL: " + cmd["status"], (10, 30),
+                    cv2.putText(overlay, "HELIOS-KAL: " + cmd["status"], (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
                     ok, jpg = cv2.imencode(".jpg", overlay, encode)
                     if ok:
@@ -2107,14 +2216,14 @@ def main(argv=None) -> None:
                     if usable:
                         _save_pixel_map(res, mode="helios")
                         helios_cal_status = (
-                            f"Completed — {res['model_type']}, {res['n_samples']} points, "
+                            f"Tamamlandı — {res['model_type']}, {res['n_samples']} nokta, "
                             f"rms {res['rms_pan_deg']}/{res['rms_tilt_deg']}°, "
                             f"reproj {res['reprojection_error_px']}px"
                         )
                         if helios_cal:
                             helios_cal._log("SONUÇ: KAYDEDİLDİ — " + helios_cal_status)
                     else:
-                        helios_cal_status = f"Failed — {reason}"
+                        helios_cal_status = f"BAŞARISIZ — {reason}"
                         log(f"[HELIOS-KAL] Başarısız: {reason}.")
                         if helios_cal:
                             helios_cal._log("SONUÇ: BAŞARISIZ (kullanılamaz harita) — " + reason)
