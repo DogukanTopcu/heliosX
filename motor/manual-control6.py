@@ -1,7 +1,8 @@
 """
 Ok tuşlu manuel servo testi — pan/tilt'i ok tuşlarıyla sürer ve canlı pulse
-genişliğini (µs) gösterir. Servonun nerede zorlandığını gözle görmek için
-mekanik aralık geniş tutuldu (CLAUDE.md doğrulanmış: pan ±45°, tilt 0–75°).
+genişliğini (µs) gösterir. Derece katmanı `v2/new2.py` ile bire bir aynıdır;
+bu yüzden buradaki pan/tilt değerleri ana uygulamadaki kalibrasyonla aynı şeyi
+ifade eder.
 
 Bu sürüm RP1 DONANIM PWM kullanır (new2.py ile aynı): GPIO12=PWM0(ch0)=pan,
 GPIO13=PWM1(ch1)=tilt. Jitter'sız darbe verir.
@@ -42,10 +43,9 @@ PAN_PWM_CHANNEL = 0      # GPIO12 = PWM0
 TILT_PWM_CHANNEL = 1     # GPIO13 = PWM1
 PWM_FREQ_HZ = 50         # 20 ms periyot
 
-# --- Test için GENİŞ aralık: gerçek mekanik sınırı kendin bul ---
-# CLAUDE.md "doğrulanmış donanım gerçekleri": pan -45..45, tilt 0..75
-PAN_MIN_DEG, PAN_MAX_DEG = -45.0, 45.0
-TILT_MIN_DEG, TILT_MAX_DEG = 0.0, 75.0
+# --- Kalibre edilmiş hareket aralığı (new2.py ile aynı) ---
+PAN_MIN_DEG, PAN_MAX_DEG = -5.0, 5.0
+TILT_MIN_DEG, TILT_MAX_DEG = 0.0, 10.0
 TILT_ZERO_OFFSET = 25.0          # gösterge 0° = fiziksel alt limit
 
 step_deg = 1.0                   # ok tuşu başına derece (+/- ile değişir)
@@ -60,8 +60,8 @@ data_lock = threading.Lock()
 
 
 class HardwarePWMServo:
-    """RP1 donanım PWM'iyle servo sürer. `.value` (-1..1) setter ve `.detach()`
-    arayüzü, eski gpiozero Servo kullanımıyla bire bir uyumludur."""
+    """RP1 donanım PWM'iyle servo sürer. `.angle` (-90..90) setter ve `.detach()`
+    arayüzü, `new2.py` içindeki HardwarePWMServo ile aynı eşlemeyi verir."""
 
     def __init__(self, channel: int, chip: int = PWM_CHIP,
                  min_pw_s: float = MIN_PW, max_pw_s: float = MAX_PW,
@@ -71,26 +71,26 @@ class HardwarePWMServo:
         self.max_pw_us = max_pw_s * 1e6
         self.pwm = HardwarePWM(pwm_channel=channel, hz=freq_hz, chip=chip)
         self._started = False
-        self._value: float | None = None
+        self._angle: float | None = None
 
-    def _duty_for_value(self, v: float) -> float:
-        v = max(-1.0, min(1.0, v))
-        pw_us = self.min_pw_us + (v + 1.0) / 2.0 * (self.max_pw_us - self.min_pw_us)
+    def _duty_for_angle(self, deg: float) -> float:
+        deg = max(-90.0, min(90.0, deg))
+        pw_us = self.min_pw_us + (deg + 90.0) / 180.0 * (self.max_pw_us - self.min_pw_us)
         return pw_us / self.period_us * 100.0
 
     @property
-    def value(self) -> float | None:
-        return self._value
+    def angle(self) -> float | None:
+        return self._angle
 
-    @value.setter
-    def value(self, v: float) -> None:
-        duty = self._duty_for_value(v)
+    @angle.setter
+    def angle(self, deg: float) -> None:
+        duty = self._duty_for_angle(deg)
         if not self._started:
             self.pwm.start(duty)
             self._started = True
         else:
             self.pwm.change_duty_cycle(duty)
-        self._value = v
+        self._angle = deg
 
     def detach(self) -> None:
         if self._started:
@@ -102,18 +102,18 @@ pan_servo = HardwarePWMServo(PAN_PWM_CHANNEL)
 tilt_servo = HardwarePWMServo(TILT_PWM_CHANNEL)
 
 
-def pan_to_servo_val(deg: float) -> float:
-    return deg / 90.0
+def pan_to_servo_angle(deg: float) -> float:
+    return deg
 
 
-def tilt_to_servo_val(deg: float) -> float:
-    return ((deg + TILT_ZERO_OFFSET) / 90.0) - 1.0
+def tilt_to_servo_angle(deg: float) -> float:
+    return deg + TILT_ZERO_OFFSET - 90.0
 
 
-def servo_val_to_pw_us(v: float) -> float:
-    """Servo value (-1..1) -> pulse genişliği (mikrosaniye)."""
-    v = max(-1.0, min(1.0, v))
-    pw = MIN_PW + (v + 1.0) / 2.0 * (MAX_PW - MIN_PW)
+def servo_angle_to_pw_us(deg: float) -> float:
+    """Servo angle (-90..90) -> pulse genişliği (mikrosaniye)."""
+    deg = max(-90.0, min(90.0, deg))
+    pw = MIN_PW + (deg + 90.0) / 180.0 * (MAX_PW - MIN_PW)
     return pw * 1e6
 
 
@@ -127,11 +127,11 @@ def motor_smooth_thread() -> None:
         pan_diff = t_pan - current_pan_deg
         if abs(pan_diff) > threshold:
             current_pan_deg += pan_diff * smooth_factor
-            pan_servo.value = pan_to_servo_val(current_pan_deg)
+            pan_servo.angle = pan_to_servo_angle(current_pan_deg)
         tilt_diff = t_tilt - current_tilt_deg
         if abs(tilt_diff) > threshold:
             current_tilt_deg += tilt_diff * smooth_factor
-            tilt_servo.value = tilt_to_servo_val(current_tilt_deg)
+            tilt_servo.angle = tilt_to_servo_angle(current_tilt_deg)
         time.sleep(0.005)
 
 
@@ -152,10 +152,12 @@ def read_key() -> str:
 
 
 def print_status() -> None:
-    pan_pw = servo_val_to_pw_us(pan_to_servo_val(target_pan_deg))
-    tilt_pw = servo_val_to_pw_us(tilt_to_servo_val(target_tilt_deg))
-    print(f"\r  PAN {target_pan_deg:>+6.1f}° ({pan_pw:4.0f}µs)  |  "
-          f"TILT {target_tilt_deg:>6.1f}° ({tilt_pw:4.0f}µs)  |  "
+    pan_angle = pan_to_servo_angle(target_pan_deg)
+    tilt_angle = tilt_to_servo_angle(target_tilt_deg)
+    pan_pw = servo_angle_to_pw_us(pan_angle)
+    tilt_pw = servo_angle_to_pw_us(tilt_angle)
+    print(f"\r  PAN {target_pan_deg:>+5.1f}° -> servo {pan_angle:>+5.1f}° ({pan_pw:4.0f}µs)  |  "
+          f"TILT {target_tilt_deg:>4.1f}° -> servo {tilt_angle:>+5.1f}° ({tilt_pw:4.0f}µs)  |  "
           f"adim {step_deg:.1f}°     ",
           end="", flush=True)
 
@@ -182,8 +184,8 @@ def sweep(axis: str) -> None:
 def main() -> None:
     global target_pan_deg, target_tilt_deg, step_deg, is_running
 
-    pan_servo.value = pan_to_servo_val(target_pan_deg)
-    tilt_servo.value = tilt_to_servo_val(target_tilt_deg)
+    pan_servo.angle = pan_to_servo_angle(target_pan_deg)
+    tilt_servo.angle = tilt_to_servo_angle(target_tilt_deg)
     time.sleep(0.5)
 
     t = threading.Thread(target=motor_smooth_thread, daemon=True)
@@ -195,7 +197,7 @@ def main() -> None:
           f"Tilt: {TILT_MIN_DEG:.0f}..{TILT_MAX_DEG:.0f}°   "
           f"(pulse {MIN_PW*1000:.1f}-{MAX_PW*1000:.1f} ms, "
           f"pwmchip{PWM_CHIP} ch{PAN_PWM_CHANNEL}/{TILT_PWM_CHANNEL})")
-    print("Servo bir noktada vinliyor/titriyorsa orasi mekanik limittir — not al.")
+    print("Bu aralik ana uygulamadaki kalibreli araliktir; derece hissi bire bir ayni olmali.")
     print("-" * 70)
     print_status()
 
