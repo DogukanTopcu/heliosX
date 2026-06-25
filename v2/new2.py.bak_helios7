@@ -1956,15 +1956,6 @@ function post(u){
       if(el) el.textContent='Kalibrasyon servisine erisilemiyor: '+String(err)
     })
 }
-function setStaticBtn(on){
-  const b=document.getElementById('static-btn')
-  if(!b) return
-  b.textContent='🎯 Statik Test: '+(on?'AÇIK':'KAPALI')
-  b.style.borderColor = on ? '#2a7d46' : ''
-}
-function toggleStatic(){
-  fetch('/detect/static/toggle',{method:'POST'}).then(r=>r.json()).then(d=>setStaticBtn(d.active)).catch(()=>{})
-}
 function refresh(){
   fetch('/status').then(r=>r.json()).then(d=>{
     document.getElementById('s-fps').textContent = d.fps+' fps'
@@ -1976,7 +1967,6 @@ function refresh(){
     document.getElementById('s-kld').textContent = d.killed
     document.getElementById('s-pan').textContent = d.pan_deg+'°'
     document.getElementById('s-tlt').textContent = d.tilt_deg+'°'
-    setStaticBtn(d.static_test_active)
   }).catch(err=>{
     document.getElementById('s-fps').textContent='hata'
     document.getElementById('s-trk').textContent='hata'
@@ -2908,13 +2898,10 @@ def motor_smooth_thread():
             tilt_active = True
             continue
 
-        # Kalibrasyon sırasında DETACH ETME: enerji kesilince servo tutma torkunu
-        # kaybedip yerçekimiyle başka yere düşer ("saçma yere dönme") ve ölçüm bozulur.
-        cal_active = helios_cal_active or auto_cal_active or boundary_cal_active
-        if pan_active and not cal_active:
+        if pan_active:
             pan_servo.detach()
             pan_active = False
-        if tilt_active and not cal_active:
+        if tilt_active:
             tilt_servo.detach()
             tilt_active = False
         time.sleep(0.005)
@@ -3557,7 +3544,6 @@ def main(argv=None) -> None:
                     "pan_deg":   round(current_pan_deg, 1),
                     "tilt_deg":  round(current_tilt_deg, 1),
                     "calibrating": calibrating,
-                    "static_test_active": static_test_active,
                     "auto_cal_active": auto_cal_active,
                     "boundary_cal_active": boundary_cal_active,
                     "mode": ("boundary_cal" if boundary_cal_active else

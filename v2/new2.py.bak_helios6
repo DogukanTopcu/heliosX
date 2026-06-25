@@ -1404,7 +1404,6 @@ killed_flies = set()        # 3 saniye boyunca vurularak imha edilen sineklerin 
 
 # Kalibrasyon modu
 calibrating: bool = False
-static_test_active: bool = False       # statik test modu: hareketsiz nesneyi de bul
 calib_click_px: tuple[float, float] | None = None
 auto_cal_active: bool = False          # web handler bunu set eder, main loop yakalar
 auto_cal_status: str = ""              # otomatik kalibrasyon ilerleme mesajı (UI için)
@@ -1757,7 +1756,7 @@ class Tracker:
                 continue
             if (frame_idx - tr.first_frame) < CONFIRM_FRAMES:
                 continue
-            if not static_test_active and tr.path_length() < MIN_PATH_LENGTH:
+            if tr.path_length() < MIN_PATH_LENGTH:
                 continue
             if tr.direction_changes() < MIN_DIR_CHANGES:
                 continue
@@ -1791,7 +1790,7 @@ class MaskPipeline:
              ensure_odd(EXCLUSION_DILATE_KERNEL, 3)),
         )
 
-    def process(self, gray: np.ndarray, static: bool = False):
+    def process(self, gray: np.ndarray):
         blur = cv2.GaussianBlur(gray, (ensure_odd(BLUR_KERNEL), ensure_odd(BLUR_KERNEL)), 0)
         enhanced = self.clahe.apply(blur)
 
@@ -1813,11 +1812,8 @@ class MaskPipeline:
         )
 
         motion_dil = cv2.dilate(motion_clean, self.k3, iterations=MOTION_DILATE)
-        if static:
-            combined = cv2.bitwise_and(dark, adaptive)        # statik: hareket şartı yok
-        else:
-            combined = cv2.bitwise_and(motion_dil, dark)
-            combined = cv2.bitwise_and(combined, adaptive)
+        combined = cv2.bitwise_and(motion_dil, dark)
+        combined = cv2.bitwise_and(combined, adaptive)
         combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, self.k3, iterations=1)
         combined = cv2.dilate(combined, self.k3, iterations=1)
 
@@ -1932,7 +1928,6 @@ a{color:#5af;text-decoration:none}
       <h3>Operasyon</h3>
       <button class="btn btn-danger" onclick="post('/laser/off')">⬛ Lazer KAPAT</button>
       <button class="btn" onclick="post('/laser/on')">🔴 Lazer AÇ (test)</button>
-      <button class="btn" id="static-btn" onclick="toggleStatic()">🎯 Statik Test: KAPALI</button>
       <button class="btn" onclick="post('/reset')">↺ Hedef Listesini Sıfırla</button>
     </div>
 
@@ -1956,15 +1951,6 @@ function post(u){
       if(el) el.textContent='Kalibrasyon servisine erisilemiyor: '+String(err)
     })
 }
-function setStaticBtn(on){
-  const b=document.getElementById('static-btn')
-  if(!b) return
-  b.textContent='🎯 Statik Test: '+(on?'AÇIK':'KAPALI')
-  b.style.borderColor = on ? '#2a7d46' : ''
-}
-function toggleStatic(){
-  fetch('/detect/static/toggle',{method:'POST'}).then(r=>r.json()).then(d=>setStaticBtn(d.active)).catch(()=>{})
-}
 function refresh(){
   fetch('/status').then(r=>r.json()).then(d=>{
     document.getElementById('s-fps').textContent = d.fps+' fps'
@@ -1976,7 +1962,6 @@ function refresh(){
     document.getElementById('s-kld').textContent = d.killed
     document.getElementById('s-pan').textContent = d.pan_deg+'°'
     document.getElementById('s-tlt').textContent = d.tilt_deg+'°'
-    setStaticBtn(d.static_test_active)
   }).catch(err=>{
     document.getElementById('s-fps').textContent='hata'
     document.getElementById('s-trk').textContent='hata'
@@ -2248,15 +2233,6 @@ function startAutoCalib(){
     document.getElementById('auto-status').textContent='Hata: '+String(err)
   })
 }
-function setStaticBtn(on){
-  const b=document.getElementById('static-btn')
-  if(!b) return
-  b.textContent='🎯 Statik Test: '+(on?'AÇIK':'KAPALI')
-  b.style.borderColor = on ? '#2a7d46' : ''
-}
-function toggleStatic(){
-  fetchJson('/detect/static/toggle',{method:'POST'}).then(d=>{ setStaticBtn(d.active) }).catch(()=>{})
-}
 function startHeliosCalib(){
   document.getElementById('helios-status').textContent='Başlatılıyor… önce tam tarama.'
   fetchJson('/calibrate/helios',{method:'POST'}).then(d=>{
@@ -2315,7 +2291,6 @@ function refreshStatus(){
       if(d.helios_cal_active) h.textContent='⏳ '+(d.helios_cal_status||'çalışıyor…')
       else if(d.helios_cal_status) h.textContent=d.helios_cal_status
     }
-    setStaticBtn(d.static_test_active)
     const b=document.getElementById('boundary-status')
     const bd=document.getElementById('boundary-detail')
     if(d.boundary_cal_active) b.textContent='⏳ '+(d.boundary_cal_status||'çalışıyor…')
@@ -2430,7 +2405,6 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                     "auto_cal_status":    auto_cal_status,
                     "helios_cal_active":  helios_cal_active,
                     "helios_cal_status":  helios_cal_status,
-                    "static_test_active": static_test_active,
                     "boundary_cal_active": boundary_cal_active,
                     "boundary_cal_status": boundary_cal_status,
                     "boundary_cal_snapshot": boundary_cal_snapshot,
@@ -2447,7 +2421,6 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
             global boundary_cal_active, boundary_cal_status, boundary_cal_snapshot
             global helios_cal_active, helios_cal_status
             global ACTIVE_MOVE_DURATION
-            global static_test_active
             global target_pan_deg, target_tilt_deg
             global sim_laser_on
             global manual5_active, manual5_step, manual5_clicks
@@ -2619,12 +2592,6 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 ACTIVE_MOVE_DURATION = SERVO_MOVE_DURATION
                 log("[HELIOS-KAL] İptal edildi.")
                 self._json_ok({"status": "cancelled"})
-
-            elif self.path == "/detect/static/toggle":
-                with data_lock:
-                    static_test_active = not static_test_active
-                log(f"[STATİK TEST] {'AÇIK' if static_test_active else 'KAPALI'}")
-                self._json_ok({"status": "ok", "active": static_test_active})
 
             elif self.path == "/calibrate/boundary/start":
                 if calibrating or auto_cal_active or helios_cal_active:
@@ -2908,13 +2875,10 @@ def motor_smooth_thread():
             tilt_active = True
             continue
 
-        # Kalibrasyon sırasında DETACH ETME: enerji kesilince servo tutma torkunu
-        # kaybedip yerçekimiyle başka yere düşer ("saçma yere dönme") ve ölçüm bozulur.
-        cal_active = helios_cal_active or auto_cal_active or boundary_cal_active
-        if pan_active and not cal_active:
+        if pan_active:
             pan_servo.detach()
             pan_active = False
-        if tilt_active and not cal_active:
+        if tilt_active:
             tilt_servo.detach()
             tilt_active = False
         time.sleep(0.005)
@@ -3087,7 +3051,7 @@ def main(argv=None) -> None:
                 pipeline.prev_blur = None
                 exposure_settle -= 1
 
-            enhanced, motion, motion_exclude, blackhat, combined = pipeline.process(gray, static_test_active)
+            enhanced, motion, motion_exclude, blackhat, combined = pipeline.process(gray)
 
             if frame_idx < WARMUP_FRAMES:
                 frame_idx += 1
@@ -3385,7 +3349,7 @@ def main(argv=None) -> None:
 
                     bbox_motion = motion[y:y + h, x:x + w]
                     motion_score = float(np.mean(bbox_motion)) / 255.0
-                    if not static_test_active and motion_score < MIN_MOTION_SCORE:
+                    if motion_score < MIN_MOTION_SCORE:
                         continue
 
                     bbox_bh = blackhat[y:y + h, x:x + w]
@@ -3557,7 +3521,6 @@ def main(argv=None) -> None:
                     "pan_deg":   round(current_pan_deg, 1),
                     "tilt_deg":  round(current_tilt_deg, 1),
                     "calibrating": calibrating,
-                    "static_test_active": static_test_active,
                     "auto_cal_active": auto_cal_active,
                     "boundary_cal_active": boundary_cal_active,
                     "mode": ("boundary_cal" if boundary_cal_active else

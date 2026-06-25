@@ -2908,13 +2908,10 @@ def motor_smooth_thread():
             tilt_active = True
             continue
 
-        # Kalibrasyon sırasında DETACH ETME: enerji kesilince servo tutma torkunu
-        # kaybedip yerçekimiyle başka yere düşer ("saçma yere dönme") ve ölçüm bozulur.
-        cal_active = helios_cal_active or auto_cal_active or boundary_cal_active
-        if pan_active and not cal_active:
+        if pan_active:
             pan_servo.detach()
             pan_active = False
-        if tilt_active and not cal_active:
+        if tilt_active:
             tilt_servo.detach()
             tilt_active = False
         time.sleep(0.005)
