@@ -281,6 +281,35 @@ def _adjust_exposure(cam, brightness: float) -> bool:
     return True
 
 
+def _manual5_positions() -> list[tuple[float, float]]:
+    """5-nokta manuel kalibrasyon servo konumları: merkez, sol, sağ, yukarı, aşağı."""
+    pm = (PAN_MIN_DEG + PAN_MAX_DEG) / 2
+    tm = (TILT_MIN_DEG + TILT_MAX_DEG) / 2
+    ps = max(1.0, (PAN_MAX_DEG - PAN_MIN_DEG) * 0.30)
+    ts = max(1.0, (TILT_MAX_DEG - TILT_MIN_DEG) * 0.30)
+    return [
+        (pm,      tm),
+        (pm - ps, tm),
+        (pm + ps, tm),
+        (pm,      tm + ts),
+        (pm,      tm - ts),
+    ]
+
+
+def _serpentine_grid(pans: list[float], tilts: list[float]) -> list[tuple[float, float]]:
+    grid: list[tuple[float, float]] = []
+    for j, tilt in enumerate(tilts):
+        row = pans if j % 2 == 0 else list(reversed(pans))
+        grid += [(pan, tilt) for pan in row]
+    return grid
+
+
+def _linspace(start: float, stop: float, count: int) -> list[float]:
+    if count <= 1:
+        return [float(start)]
+    return [start + (stop - start) * i / (count - 1) for i in range(count)]
+
+
 def _minimum_calibration_span() -> tuple[float, float]:
     """Servo aralığı ve kamera FoV'una göre gerekli minimum piksel yayılımı."""
     expected_x = PROCESS_W * (PAN_MAX_DEG - PAN_MIN_DEG) / CAMERA_FOV_H_DEG
@@ -353,12 +382,7 @@ def _load_calibration() -> None:
         if pan_coef.shape != (coef_len,) or tilt_coef.shape != (coef_len,):
             log("[KALİBRASYON] Piksel haritası REDDEDİLDİ: katsayı boyutu hatalı.")
             return
-        if data.get("manual5_calibration"):
-            min_samp = 4
-        elif data.get("helios_calibration"):
-            min_samp = HELIOS_MIN_SAMPLES
-        else:
-            min_samp = AUTOCAL_MIN_SAMPLES
+        min_samp = 4 if data.get("manual5_calibration") else AUTOCAL_MIN_SAMPLES
         if len(samples) < min_samp or hull.ndim != 2 or hull.shape[0] < 3:
             log("[KALİBRASYON] Piksel haritası REDDEDİLDİ: örnek/hull verisi eksik.")
             return
@@ -376,50 +400,6 @@ def _load_calibration() -> None:
             f"[{data.get('calibrated_at', '?')}]")
     except Exception as e:
         log(f"Kalibrasyon dosyası okunamadı: {e} — offset=(0,0) kullanılıyor.")
-
-
-PROFILES_DIR = "/home/heliosx/v2/calibrations"
-
-
-def _sanitize_profile_name(name: str) -> str:
-    name = "".join(c for c in str(name) if c.isalnum() or c in " -_").strip()
-    return name[:60]
-
-
-def _profile_path(name: str) -> str:
-    return os.path.join(PROFILES_DIR, name + ".json")
-
-
-def _list_profiles() -> list:
-    out = []
-    if not os.path.isdir(PROFILES_DIR):
-        return out
-    cur_at = None
-    if os.path.exists(CALIB_PATH):
-        try:
-            with open(CALIB_PATH) as f:
-                cur_at = _json.load(f).get("calibrated_at")
-        except Exception:
-            pass
-    for fn in sorted(os.listdir(PROFILES_DIR)):
-        if not fn.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(PROFILES_DIR, fn)) as f:
-                d = _json.load(f)
-        except Exception:
-            continue
-        out.append({
-            "name": fn[:-5],
-            "model_type": d.get("model_type"),
-            "n_samples": d.get("n_samples"),
-            "rms_pan_deg": d.get("rms_pan_deg"),
-            "rms_tilt_deg": d.get("rms_tilt_deg"),
-            "reprojection_error_px": d.get("reprojection_error_px"),
-            "calibrated_at": d.get("calibrated_at"),
-            "active": bool(cur_at) and d.get("calibrated_at") == cur_at,
-        })
-    return out
 
 
 def _detect_laser_dot(small_bgr, ref_bgr=None):
@@ -643,6 +623,86 @@ def _is_pixel_map_usable(result: dict | None) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _point_in_process_margin(px: float, py: float,
+                             margin_px: float = BOUNDARY_FRAME_MARGIN_PX) -> bool:
+    return (margin_px <= px <= (PROCESS_W - margin_px)
+            and margin_px <= py <= (PROCESS_H - margin_px))
+
+
+def _boundary_safe_area(boundary_points: dict[str, dict]) -> dict | None:
+    required = {"left", "right", "up", "down"}
+    if set(boundary_points) != required:
+        return None
+    left = boundary_points["left"]
+    right = boundary_points["right"]
+    up = boundary_points["up"]
+    down = boundary_points["down"]
+
+    pan_min = float(left["pan"]) + BOUNDARY_SCAN_STEP_PAN_DEG
+    pan_max = float(right["pan"]) - BOUNDARY_SCAN_STEP_PAN_DEG
+    tilt_min = float(down["tilt"]) + BOUNDARY_SCAN_STEP_TILT_DEG
+    tilt_max = float(up["tilt"]) - BOUNDARY_SCAN_STEP_TILT_DEG
+    x_min = float(left["px"]) + BOUNDARY_SAFE_PIXEL_MARGIN
+    x_max = float(right["px"]) - BOUNDARY_SAFE_PIXEL_MARGIN
+    y_min = float(up["py"]) + BOUNDARY_SAFE_PIXEL_MARGIN
+    y_max = float(down["py"]) - BOUNDARY_SAFE_PIXEL_MARGIN
+
+    if pan_min >= pan_max or tilt_min >= tilt_max or x_min >= x_max or y_min >= y_max:
+        return None
+
+    polygon = [
+        [round(x_min, 2), round(y_min, 2)],
+        [round(x_max, 2), round(y_min, 2)],
+        [round(x_max, 2), round(y_max, 2)],
+        [round(x_min, 2), round(y_max, 2)],
+    ]
+    hull_src = np.asarray(
+        [[left["px"], left["py"]],
+         [right["px"], right["py"]],
+         [up["px"], up["py"]],
+         [down["px"], down["py"]]],
+        dtype=np.float32,
+    )
+    hull = cv2.convexHull(hull_src).reshape(-1, 2)
+    return {
+        "pan_min": round(pan_min, 4),
+        "pan_max": round(pan_max, 4),
+        "tilt_min": round(tilt_min, 4),
+        "tilt_max": round(tilt_max, 4),
+        "x_min": round(x_min, 2),
+        "x_max": round(x_max, 2),
+        "y_min": round(y_min, 2),
+        "y_max": round(y_max, 2),
+        "safe_polygon": polygon,
+        "boundary_hull": [[round(float(x), 2), round(float(y), 2)] for x, y in hull],
+    }
+
+
+def _boundary_grid_plan(safe_area: dict,
+                        cols: int = AUTOCAL_GRID_PAN,
+                        rows: int = AUTOCAL_GRID_TILT) -> list[dict]:
+    pans = _linspace(float(safe_area["pan_min"]), float(safe_area["pan_max"]), cols)
+    tilts = _linspace(float(safe_area["tilt_min"]), float(safe_area["tilt_max"]), rows)
+    grid = _serpentine_grid(pans, tilts)
+    y_span = max(float(safe_area["y_max"]) - float(safe_area["y_min"]), 1e-6)
+    x_span = max(float(safe_area["x_max"]) - float(safe_area["x_min"]), 1e-6)
+    tilt_span = max(float(safe_area["tilt_max"]) - float(safe_area["tilt_min"]), 1e-6)
+    pan_span = max(float(safe_area["pan_max"]) - float(safe_area["pan_min"]), 1e-6)
+    planned = []
+    for pan, tilt in grid:
+        u = (pan - float(safe_area["pan_min"])) / pan_span
+        v = (tilt - float(safe_area["tilt_min"])) / tilt_span
+        px = float(safe_area["x_min"]) + x_span * u
+        py = float(safe_area["y_max"]) - y_span * v
+        planned.append({
+            "pan": round(float(pan), 4),
+            "tilt": round(float(tilt), 4),
+            "planned_px": round(float(px), 2),
+            "planned_py": round(float(py), 2),
+        })
+    return planned
+
+
 def _summarize_dot_samples(dots: list[tuple[float, float, float]]) -> tuple[dict | None, str | None]:
     if len(dots) < AUTOCAL_MIN_OBSERVATIONS:
         return None, f"yetersiz gözlem ({len(dots)})"
@@ -668,6 +728,35 @@ def _summarize_dot_samples(dots: list[tuple[float, float, float]]) -> tuple[dict
         "area": mean_area,
         "jitter_px": jitter,
         "weight": max(0.25, weight),
+    }, None
+
+
+def _summarize_home_dot_samples(dots: list[tuple[float, float, float]]) -> tuple[dict | None, str | None]:
+    """Boundary kalibrasyonunun home adımı için biraz daha toleranslı özet.
+    Home örneği fit'e girmiyor; yalnız ilk adımda noktanın gerçekten yer değiştirdiğini
+    anlamak için referans olarak kullanılıyor."""
+    summary, err = _summarize_dot_samples(dots)
+    if summary is not None:
+        return summary, None
+    if err is None or "yüksek jitter" not in err:
+        return None, err
+    if len(dots) < AUTOCAL_MIN_OBSERVATIONS:
+        return None, err
+    xs = np.array([d[0] for d in dots], dtype=np.float64)
+    ys = np.array([d[1] for d in dots], dtype=np.float64)
+    areas = np.array([d[2] for d in dots], dtype=np.float64)
+    mean_x = float(np.mean(xs))
+    mean_y = float(np.mean(ys))
+    mean_area = float(np.mean(areas))
+    jitter = float(np.sqrt(np.mean((xs - mean_x) ** 2 + (ys - mean_y) ** 2)))
+    if jitter > BOUNDARY_HOME_MAX_JITTER_PX:
+        return None, f"yüksek jitter ({jitter:.1f}px)"
+    return {
+        "px": mean_x,
+        "py": mean_y,
+        "area": mean_area,
+        "jitter_px": jitter,
+        "weight": 0.25,
     }, None
 
 
@@ -888,6 +977,507 @@ class HeliosCalibrator:
 
         return {"laser": False, "done": True, "status": self.status, "result": self.result}
 
+class AutoCalibrator:
+    """Servoları ızgarada gezdirip her noktada lazer noktasını tespit eder,
+    piksel→servo haritasını fit eder. Main loop her frame'de update() çağırır;
+    dönen dict main loop'a hangi açıya gidileceğini ve lazer durumunu söyler."""
+
+    def __init__(self) -> None:
+        pan_min = PAN_MIN_DEG + AUTOCAL_GRID_PAN_MARGIN_DEG
+        pan_max = PAN_MAX_DEG - AUTOCAL_GRID_PAN_MARGIN_DEG
+        tilt_min = TILT_MIN_DEG + AUTOCAL_GRID_TILT_MARGIN_DEG
+        tilt_max = TILT_MAX_DEG - AUTOCAL_GRID_TILT_MARGIN_DEG
+        pans = _linspace(pan_min, pan_max, AUTOCAL_GRID_PAN)
+        tilts = _linspace(tilt_min, tilt_max, AUTOCAL_GRID_TILT)
+        # Yılan sıralama yalnızca transit mesafesini azaltır; motor thread'i her hedefe
+        # düşük açı yönünden final yaklaşımı yaparak backlash yönünü sabit tutar.
+        self.grid: list[tuple[float, float]] = _serpentine_grid(pans, tilts)
+        self.i = 0
+        self.samples: list[dict] = []
+        self.ref = None
+        self.ref_frames: list[np.ndarray] = []
+        self.phase = "ref"
+        self.counter = AUTOCAL_REF_FR
+        self.status = "Referans alınıyor (lazer kapalı)…"
+        self.result = None
+        self.dot_samples: list[tuple[float, float, float]] = []
+        self.last_dot: tuple[float, float, float] | None = None
+
+    def update(self, small_bgr) -> dict:
+        n = len(self.grid)
+        if self.phase == "ref":
+            self.ref_frames.append(small_bgr.copy())
+            self.counter -= 1
+            if self.counter <= 0:
+                self.ref = np.median(np.stack(self.ref_frames), axis=0).astype(np.uint8)
+                self.ref_frames.clear()
+                self.phase = "settle"
+                self.counter = AUTOCAL_SETTLE_FR
+                self.dot_samples = []
+                p, t = self.grid[self.i]
+                self.status = f"Tarama 1/{n}"
+                return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+            return {"laser": False, "done": False, "status": self.status}
+
+        if self.phase == "settle":
+            self.counter -= 1
+            p, t = self.grid[self.i]
+            if self.counter > 0:
+                return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+            self.phase = "measure"
+            self.counter = AUTOCAL_MEASURE_FR
+            self.dot_samples = []
+            self.status = f"Tarama {self.i + 1}/{n} ölçülüyor"
+            return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+
+        if self.phase == "measure":
+            p, t = self.grid[self.i]
+            dot = _detect_laser_dot(small_bgr, self.ref)
+            if dot is not None:
+                self.dot_samples.append(dot)
+                self.last_dot = dot
+            self.counter -= 1
+            if self.counter > 0:
+                found = len(self.dot_samples)
+                self.status = f"Tarama {self.i + 1}/{n} ölçülüyor ({found}/{AUTOCAL_MEASURE_FR})"
+                return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
+
+            summary, err = _summarize_dot_samples(self.dot_samples)
+            if summary is not None:
+                self.samples.append({
+                    "pan": round(float(p), 4),
+                    "tilt": round(float(t), 4),
+                    "px": round(float(summary["px"]), 3),
+                    "py": round(float(summary["py"]), 3),
+                    "jitter_px": round(float(summary["jitter_px"]), 3),
+                    "weight": round(float(summary["weight"]), 3),
+                })
+                log(f"[OTO-KAL] {self.i + 1}/{n}: pan={p:.0f}° tilt={t:.0f}° "
+                    f"-> lazer px=({summary['px']:.1f},{summary['py']:.1f}) "
+                    f"alan={summary['area']:.1f} jitter={summary['jitter_px']:.1f}px "
+                    f"w={summary['weight']:.2f} obs={len(self.dot_samples)}")
+            else:
+                reason = err or "bilinmeyen hata"
+                seen = len(self.dot_samples)
+                log(f"[OTO-KAL] {self.i + 1}/{n}: pan={p:.0f}° tilt={t:.0f}° "
+                    f"-> RED ({reason}, obs={seen})")
+            self.i += 1
+            if self.i >= n:
+                self.phase = "done"
+                self.result = _fit_pixel_to_servo(self.samples)
+                return {"laser": False, "done": True,
+                        "status": f"Bitti — {len(self.samples)}/{n} nokta bulundu",
+                        "result": self.result}
+            np_, nt = self.grid[self.i]
+            self.phase = "settle"
+            self.counter = AUTOCAL_SETTLE_FR
+            self.dot_samples = []
+            self.status = f"Tarama {self.i + 1}/{n} ({len(self.samples)} nokta bulundu)"
+            return {"pan": np_, "tilt": nt, "laser": True, "done": False, "status": self.status}
+
+        return {"laser": False, "done": True, "status": self.status, "result": self.result}
+
+
+class BoundaryGridCalibrator:
+    """Önce lazerin erişebildiği alanı dört yönde keşfeder, sonra güvenli iç bölgede
+    grid ölçümü yapıp mevcut piksel→servo modeline fit eder."""
+
+    def __init__(self) -> None:
+        self.phase = "ref"
+        self.status = "Boundary + Grid kalibrasyonu hazırlanıyor…"
+        self.counter = AUTOCAL_REF_FR
+        self.ref = None
+        self.ref_frames: list[np.ndarray] = []
+        self.dot_samples: list[tuple[float, float, float]] = []
+        self.last_dot: tuple[float, float, float] | None = None
+        self.last_rejection_reason = ""
+        self.result = None
+        self.started_at = time.monotonic()
+        self.home = (PAN_HOME_DEG, TILT_HOME_DEG)
+        self.current_target = self.home
+        self.home_sample: dict | None = None
+        self.boundary_points: dict[str, dict] = {}
+        self.boundary_samples: list[dict] = []
+        self.direction_points: list[dict] = []
+        self.safe_area: dict | None = None
+        self.grid_plan: list[dict] = []
+        self.samples: list[dict] = []
+        self.rejected_samples: list[dict] = []
+        self.quality: dict = {}
+        self.direction_index = 0
+        self.pending_direction_index = 0
+        self.step_index = 0
+        self.measurement_label = ""
+        self.measurement_kind = "boundary"
+        self.directions = [
+            {"name": "left", "label": "sol", "dp": -BOUNDARY_SCAN_STEP_PAN_DEG, "dt": 0.0,
+             "limit": PAN_MIN_DEG},
+            {"name": "right", "label": "sağ", "dp": BOUNDARY_SCAN_STEP_PAN_DEG, "dt": 0.0,
+             "limit": PAN_MAX_DEG},
+            {"name": "up", "label": "yukarı", "dp": 0.0, "dt": BOUNDARY_SCAN_STEP_TILT_DEG,
+             "limit": TILT_MAX_DEG},
+            {"name": "down", "label": "aşağı", "dp": 0.0, "dt": -BOUNDARY_SCAN_STEP_TILT_DEG,
+             "limit": TILT_MIN_DEG},
+        ]
+
+    def _current_direction(self) -> dict:
+        return self.directions[self.direction_index]
+
+    def _command(self, laser: bool, done: bool = False) -> dict:
+        return {
+            "pan": self.current_target[0],
+            "tilt": self.current_target[1],
+            "laser": laser,
+            "done": done,
+            "status": self.status,
+            "snapshot": self.snapshot(),
+            "result": self.result,
+        }
+
+    def _fail(self, reason: str) -> dict:
+        self.phase = "failed"
+        self.status = f"BAŞARISIZ — {reason}"
+        self.last_rejection_reason = reason
+        return self._command(False, done=True)
+
+    def _direction_target(self, spec: dict, step_index: int) -> tuple[float, float]:
+        pan = self.home[0] + spec["dp"] * step_index
+        tilt = self.home[1] + spec["dt"] * step_index
+        pan = max(PAN_MIN_DEG, min(PAN_MAX_DEG, pan))
+        tilt = max(TILT_MIN_DEG, min(TILT_MAX_DEG, tilt))
+        return pan, tilt
+
+    def _at_limit(self, spec: dict, target: tuple[float, float]) -> bool:
+        if spec["name"] in ("left", "right"):
+            return abs(target[0] - float(spec["limit"])) <= 1e-6
+        return abs(target[1] - float(spec["limit"])) <= 1e-6
+
+    def _start_direction(self, direction_index: int) -> None:
+        self.direction_index = direction_index
+        self.direction_points = []
+        self.step_index = 1
+        spec = self._current_direction()
+        self.current_target = self._direction_target(spec, self.step_index)
+        self.phase = "scan_settle"
+        self.counter = AUTOCAL_SETTLE_FR
+        self.measurement_kind = "boundary"
+        self.measurement_label = spec["label"]
+        self.status = f"Sınır taraması: {spec['label']} 1. adım"
+
+    def _advance_direction(self, reason: str | None = None) -> None:
+        spec = self._current_direction()
+        if not self.direction_points:
+            self.last_rejection_reason = reason or "sınır bulunamadı"
+            raise RuntimeError(f"{spec['label']} sınırı bulunamadı: {self.last_rejection_reason}")
+        boundary = dict(self.direction_points[-1])
+        boundary["final_reason"] = reason or "limit"
+        self.boundary_points[spec["name"]] = boundary
+        next_index = self.direction_index + 1
+        if next_index >= len(self.directions):
+            self._prepare_grid()
+            return
+        self.pending_direction_index = next_index
+        self.current_target = self.home
+        self.phase = "scan_home"
+        self.counter = AUTOCAL_SETTLE_FR
+        self.status = f"{spec['label']} sınırı bulundu — merkeze dönülüyor"
+
+    def _prepare_grid(self) -> None:
+        if len(self.boundary_points) < 4:
+            raise RuntimeError("4 sınır noktası tamamlanamadı")
+        self.safe_area = _boundary_safe_area(self.boundary_points)
+        if self.safe_area is None:
+            raise RuntimeError("erişilebilir alan çok küçük")
+        self.grid_plan = _boundary_grid_plan(self.safe_area)
+        if len(self.grid_plan) < AUTOCAL_MIN_SAMPLES:
+            raise RuntimeError("grid örneği yetersiz")
+        self.phase = "grid_settle"
+        self.counter = AUTOCAL_SETTLE_FR
+        self.measurement_kind = "grid"
+        self.current_target = (self.grid_plan[0]["pan"], self.grid_plan[0]["tilt"])
+        self.status = f"Grid ölçümü 1/{len(self.grid_plan)}"
+
+    def _accept_boundary_point(self, summary: dict) -> tuple[bool, str | None]:
+        px = float(summary["px"])
+        py = float(summary["py"])
+        if not _point_in_process_margin(px, py):
+            return False, "frame kenarı"
+        prev = self.direction_points[-1] if self.direction_points else self.home_sample
+        if prev is not None:
+            delta = math.hypot(px - float(prev["px"]), py - float(prev["py"]))
+            if delta < BOUNDARY_STUCK_MIN_DELTA_PX:
+                return False, f"nokta takılı ({delta:.1f}px)"
+        return True, None
+
+    def _safe_rect_contains(self, px: float, py: float) -> bool:
+        if self.safe_area is None:
+            return False
+        return (float(self.safe_area["x_min"]) <= px <= float(self.safe_area["x_max"])
+                and float(self.safe_area["y_min"]) <= py <= float(self.safe_area["y_max"]))
+
+    def _record_boundary_sample(self, spec: dict, summary: dict) -> dict:
+        sample = {
+            "direction": spec["name"],
+            "pan": round(float(self.current_target[0]), 4),
+            "tilt": round(float(self.current_target[1]), 4),
+            "px": round(float(summary["px"]), 3),
+            "py": round(float(summary["py"]), 3),
+            "jitter_px": round(float(summary["jitter_px"]), 3),
+            "weight": round(float(summary["weight"]), 3),
+        }
+        self.direction_points.append(sample)
+        self.boundary_samples.append(sample)
+        return sample
+
+    def _record_grid_rejection(self, plan: dict, reason: str, summary: dict | None = None) -> None:
+        item = {
+            "pan": round(float(plan["pan"]), 4),
+            "tilt": round(float(plan["tilt"]), 4),
+            "planned_px": round(float(plan["planned_px"]), 2),
+            "planned_py": round(float(plan["planned_py"]), 2),
+            "reason": reason,
+        }
+        if summary is not None:
+            item["px"] = round(float(summary["px"]), 3)
+            item["py"] = round(float(summary["py"]), 3)
+            item["jitter_px"] = round(float(summary["jitter_px"]), 3)
+        self.rejected_samples.append(item)
+        self.last_rejection_reason = reason
+
+    def _finish_grid(self) -> dict:
+        if len(self.samples) < AUTOCAL_MIN_SAMPLES:
+            return self._fail(f"çok az grid örneği ({len(self.samples)} < {AUTOCAL_MIN_SAMPLES})")
+        self.result = _fit_pixel_to_servo(self.samples)
+        if self.result is None:
+            return self._fail("fit oluşturulamadı")
+        self.quality = {
+            "model_type": self.result["model_type"],
+            "rms_pan_deg": self.result["rms_pan_deg"],
+            "rms_tilt_deg": self.result["rms_tilt_deg"],
+            "reprojection_error_px": self.result["reprojection_error_px"],
+            "n_samples": self.result["n_samples"],
+        }
+        self.result.update({
+            "boundary_points": self.boundary_points,
+            "boundary_samples": self.boundary_samples,
+            "safe_polygon": self.safe_area["safe_polygon"] if self.safe_area else [],
+            "boundary_hull": self.safe_area["boundary_hull"] if self.safe_area else [],
+            "generated_grid_points": self.grid_plan,
+            "accepted_samples": self.samples,
+            "rejected_samples": self.rejected_samples,
+            "home_sample": self.home_sample,
+        })
+        self.phase = "done"
+        self.status = (f"Boundary + Grid tamamlandı — {self.result['model_type']} "
+                       f"{self.result['n_samples']} örnek")
+        return self._command(False, done=True)
+
+    def snapshot(self) -> dict:
+        return {
+            "phase": self.phase,
+            "direction": self.measurement_label,
+            "pan": round(float(self.current_target[0]), 3),
+            "tilt": round(float(self.current_target[1]), 3),
+            "valid_boundary_points": len(self.boundary_points),
+            "accepted_grid_samples": len(self.samples),
+            "rejected_grid_samples": len(self.rejected_samples),
+            "last_rejection_reason": self.last_rejection_reason,
+            "quality": self.quality,
+            "boundary_points": self.boundary_points,
+            "safe_polygon": [] if self.safe_area is None else self.safe_area["safe_polygon"],
+            "grid_points": self.grid_plan,
+        }
+
+    def update(self, small_bgr) -> dict:
+        if (time.monotonic() - self.started_at) > BOUNDARY_TIMEOUT_S:
+            return self._fail("zaman aşımı")
+
+        if self.phase == "ref":
+            self.ref_frames.append(small_bgr.copy())
+            self.counter -= 1
+            self.status = "Referans alınıyor (lazer kapalı)…"
+            if self.counter <= 0:
+                self.ref = np.median(np.stack(self.ref_frames), axis=0).astype(np.uint8)
+                self.ref_frames.clear()
+                self.phase = "home_settle"
+                self.counter = AUTOCAL_SETTLE_FR
+                self.current_target = self.home
+                self.status = "Home noktasına dönüldü — ölçüm hazırlığı"
+            return self._command(False, done=False)
+
+        if self.phase == "home_settle":
+            self.counter -= 1
+            if self.counter <= 0:
+                self.phase = "home_measure"
+                self.counter = AUTOCAL_MEASURE_FR
+                self.dot_samples = []
+                self.status = "Home lazer noktası ölçülüyor"
+            else:
+                self.status = "Home noktasında lazer açılıyor…"
+            return self._command(True, done=False)
+
+        if self.phase == "home_measure":
+            dot = _detect_laser_dot(small_bgr, self.ref)
+            if dot is not None:
+                self.dot_samples.append(dot)
+                self.last_dot = dot
+            self.counter -= 1
+            if self.counter > 0:
+                found = len(self.dot_samples)
+                self.status = f"Home lazer noktası ölçülüyor ({found}/{AUTOCAL_MEASURE_FR})"
+                return self._command(True, done=False)
+            summary, err = _summarize_home_dot_samples(self.dot_samples)
+            if summary is None:
+                return self._fail(f"home'da lazer bulunamadı: {err or 'ölçüm yok'}")
+            if not _point_in_process_margin(summary["px"], summary["py"]):
+                return self._fail("home lazer noktası frame kenarında")
+            self.home_sample = {
+                "pan": round(float(self.home[0]), 4),
+                "tilt": round(float(self.home[1]), 4),
+                "px": round(float(summary["px"]), 3),
+                "py": round(float(summary["py"]), 3),
+                "jitter_px": round(float(summary["jitter_px"]), 3),
+                "weight": round(float(summary["weight"]), 3),
+            }
+            self._start_direction(0)
+            return self._command(False, done=False)
+
+        if self.phase == "scan_home":
+            self.counter -= 1
+            if self.counter <= 0:
+                self._start_direction(self.pending_direction_index)
+            return self._command(False, done=False)
+
+        if self.phase == "scan_settle":
+            self.counter -= 1
+            spec = self._current_direction()
+            if self.counter <= 0:
+                self.phase = "scan_measure"
+                self.counter = AUTOCAL_MEASURE_FR
+                self.dot_samples = []
+                self.status = f"Sınır taraması: {spec['label']} ölçülüyor"
+            return self._command(False, done=False)
+
+        if self.phase == "scan_measure":
+            spec = self._current_direction()
+            dot = _detect_laser_dot(small_bgr, self.ref)
+            if dot is not None:
+                self.dot_samples.append(dot)
+                self.last_dot = dot
+            self.counter -= 1
+            if self.counter > 0:
+                self.status = (f"Sınır taraması: {spec['label']} ölçülüyor "
+                               f"({len(self.dot_samples)}/{AUTOCAL_MEASURE_FR})")
+                return self._command(True, done=False)
+            summary, err = _summarize_dot_samples(self.dot_samples)
+            if summary is None:
+                try:
+                    self._advance_direction(err or "ölçüm başarısız")
+                except RuntimeError as exc:
+                    return self._fail(str(exc))
+                return self._command(False, done=False)
+            home_limit_sample = (
+                not self.direction_points
+                and self.home_sample is not None
+                and abs(self.current_target[0] - self.home[0]) <= 1e-6
+                and abs(self.current_target[1] - self.home[1]) <= 1e-6
+                and self._at_limit(spec, self.current_target)
+            )
+            valid, reason = (True, None) if home_limit_sample else self._accept_boundary_point(summary)
+            if not valid:
+                try:
+                    self._advance_direction(reason or "sınır reddedildi")
+                except RuntimeError as exc:
+                    return self._fail(str(exc))
+                return self._command(False, done=False)
+
+            self._record_boundary_sample(spec, summary)
+            if self._at_limit(spec, self.current_target):
+                try:
+                    self._advance_direction("mekanik limit")
+                except RuntimeError as exc:
+                    return self._fail(str(exc))
+                return self._command(False, done=False)
+
+            self.step_index += 1
+            self.current_target = self._direction_target(spec, self.step_index)
+            self.phase = "scan_settle"
+            self.counter = AUTOCAL_SETTLE_FR
+            self.status = f"Sınır taraması: {spec['label']} {self.step_index}. adım"
+            return self._command(False, done=False)
+
+        if self.phase == "grid_settle":
+            index = len(self.samples) + len(self.rejected_samples)
+            self.counter -= 1
+            if self.counter <= 0:
+                self.phase = "grid_measure"
+                self.counter = AUTOCAL_MEASURE_FR
+                self.dot_samples = []
+                self.status = f"Grid ölçümü {index + 1}/{len(self.grid_plan)}"
+            return self._command(False, done=False)
+
+        if self.phase == "grid_measure":
+            index = len(self.samples) + len(self.rejected_samples)
+            plan = self.grid_plan[index]
+            dot = _detect_laser_dot(small_bgr, self.ref)
+            if dot is not None:
+                self.dot_samples.append(dot)
+                self.last_dot = dot
+            self.counter -= 1
+            if self.counter > 0:
+                self.status = (f"Grid ölçümü {index + 1}/{len(self.grid_plan)} "
+                               f"({len(self.dot_samples)}/{AUTOCAL_MEASURE_FR})")
+                return self._command(True, done=False)
+
+            summary, err = _summarize_dot_samples(self.dot_samples)
+            if summary is None:
+                self._record_grid_rejection(plan, err or "ölçüm başarısız")
+            elif not _point_in_process_margin(summary["px"], summary["py"]):
+                self._record_grid_rejection(plan, "frame kenarı", summary)
+            else:
+                self.samples.append({
+                    "pan": round(float(plan["pan"]), 4),
+                    "tilt": round(float(plan["tilt"]), 4),
+                    "px": round(float(summary["px"]), 3),
+                    "py": round(float(summary["py"]), 3),
+                    "jitter_px": round(float(summary["jitter_px"]), 3),
+                    "weight": round(float(summary["weight"]), 3),
+                })
+
+            next_index = len(self.samples) + len(self.rejected_samples)
+            if next_index >= len(self.grid_plan):
+                return self._finish_grid()
+            next_plan = self.grid_plan[next_index]
+            self.current_target = (next_plan["pan"], next_plan["tilt"])
+            self.phase = "grid_settle"
+            self.counter = AUTOCAL_SETTLE_FR
+            self.status = (f"Grid ölçümü {next_index + 1}/{len(self.grid_plan)} "
+                           f"(kabul {len(self.samples)}, red {len(self.rejected_samples)})")
+            return self._command(False, done=False)
+
+        return self._command(False, done=self.phase in ("done", "failed"))
+
+
+def _save_calibration(offset_px_x: float, offset_px_y: float,
+                      distance_cm: int = 150) -> None:
+    deg_per_px_h = CAMERA_FOV_H_DEG / PROCESS_W
+    deg_per_px_v = CAMERA_FOV_V_DEG / PROCESS_H
+    data = {
+        "laser_offset_px_x":       round(offset_px_x, 2),
+        "laser_offset_px_y":       round(offset_px_y, 2),
+        "laser_offset_deg_x":      round(offset_px_x * deg_per_px_h, 3),
+        "laser_offset_deg_y":      round(offset_px_y * deg_per_px_v, 3),
+        "calibration_distance_cm": distance_cm,
+        "calibrated_at":           _dt.datetime.now().isoformat(timespec="seconds"),
+        "process_resolution":      f"{PROCESS_W}x{PROCESS_H}",
+    }
+    with open(CALIB_PATH, "w") as f:
+        _json.dump(data, f, indent=2)
+    log(f"[KALİBRASYON] Kaydedildi: offset=({offset_px_x:.1f}, {offset_px_y:.1f})px "
+        f"= ({data['laser_offset_deg_x']:.2f}°, {data['laser_offset_deg_y']:.2f}°) "
+        f"@ {distance_cm}cm")
+
+
 # =========================================================================
 # DONANIM VE MOTOR GLOBAL DEĞİŞKENLERİ
 # =========================================================================
@@ -906,10 +1496,21 @@ lock_start_time = None      # Kilitlenme anının zaman damgası
 killed_flies = set()        # 3 saniye boyunca vurularak imha edilen sineklerin ID listesi
 
 # Kalibrasyon modu
+calibrating: bool = False
 static_test_active: bool = False       # statik test modu: hareketsiz nesneyi de bul
+calib_click_px: tuple[float, float] | None = None
+auto_cal_active: bool = False          # web handler bunu set eder, main loop yakalar
+auto_cal_status: str = ""              # otomatik kalibrasyon ilerleme mesajı (UI için)
+boundary_cal_active: bool = False      # boundary+grid kalibrasyon aktif mi
+boundary_cal_status: str = ""          # boundary+grid ilerleme mesajı
+boundary_cal_snapshot: dict = {}       # canlı durum/overlay bilgisi
 helios_cal_active: bool = False         # helios kalibrasyon aktif mi
 helios_cal_status: str = ""             # helios ilerleme mesajı (UI için)
 
+# 5-nokta manuel kalibrasyon durumu
+manual5_active: bool = False
+manual5_step: int = 0
+manual5_clicks: list = []             # {"pan", "tilt", "px", "py", "weight"} listesi
 
 # Otomatik kalibrasyon: ağırlıklı örnek tablosu + linear/quadratic kalite modeli
 HAS_PIXEL_MAP: bool = False
@@ -973,7 +1574,7 @@ class SyntheticCamera:
     def capture_array(self, stream_name="main"):
         self.frame_idx += 1
         img = np.full((self.h, self.w, 3), DRY_RUN_BG, dtype=np.uint8)
-        cal_mode = helios_cal_active
+        cal_mode = auto_cal_active or helios_cal_active or calibrating
 
         if not cal_mode:
             # hareketli küçük koyu hedef
@@ -1515,6 +2116,18 @@ input[type=number]{background:#1a1a1a;color:#ddd;border:1px solid #333;padding:6
 """ + _NAV + """
 <div class="content">
 
+<div class="card" style="border-color:#1a4a1a">
+  <h3>⚡ Otomatik Kalibrasyon (Önerilen)</h3>
+  <div class="steps">
+    Sistem servoları otomatik gezdirir, <b>kırmızı lazer noktasını kendisi bulur</b> ve
+    piksel→servo haritasını çıkarır. Tek yapman gereken:<br>
+    1. Lazerin vurduğu bölgeye düz bir yüzey (duvar/karton) koy — tarama menzilini görsün<br>
+    2. Aşağıdaki butona bas, stream'de yeşil noktalar birikirken bekle (~45 sn)
+  </div>
+  <button class="btn btn-ok" style="margin-top:10px" onclick="startAutoCalib()">⚡ Otomatik Kalibrasyonu Başlat</button>
+  <div id="auto-status" style="margin-top:10px;font-size:13px;color:#7ab">Hazır.</div>
+</div>
+
 <div class="card" style="border-color:#1a3a4a">
   <h3>☀️ Helios Kalibrasyon</h3>
   <div class="steps">
@@ -1528,19 +2141,70 @@ input[type=number]{background:#1a1a1a;color:#ddd;border:1px solid #333;padding:6
   <div id="helios-status" style="margin-top:10px;font-size:13px;color:#bdd">Hazır.</div>
 </div>
 
-<div class="card">
-  <h3>Mevcut Kalibrasyon</h3>
-  <div id="cal-status">Yükleniyor...</div>
+<div class="card" style="border-color:#4a351a">
+  <h3>🧭 Boundary + Grid Kalibrasyon</h3>
+  <div class="steps">
+    Sistem önce <b>sol / sağ / yukarı / aşağı</b> sınırları keşfeder, ardından güvenli iç bölgede
+    6×5 grid ölçerek piksel→servo haritası çıkarır.<br>
+    Bu mod mevcut auto-cal'den daha temkinlidir; erişilebilir alanı önce ölçer.
+  </div>
+  <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-ok" onclick="startBoundaryCalib()">🧭 Başlat</button>
+    <button class="btn btn-danger" onclick="cancelBoundaryCalib()">✕ İptal</button>
+  </div>
+  <div id="boundary-status" style="margin-top:10px;font-size:13px;color:#dbb">Hazır.</div>
+  <div id="boundary-detail" style="font-size:12px;color:#777;margin-top:4px;white-space:pre-line"></div>
+</div>
+
+<div class="card" style="border-color:#1a3a4a">
+  <h3>🔷 5-Nokta Manuel Kalibrasyon</h3>
+  <div class="steps">
+    Servolar 5 farklı pozisyona hareket eder; her seferinde stream'de lazer noktasına tıkla.<br>
+    Sıra: <b>Merkez → Pan Sol → Pan Sağ → Tilt Yukarı → Tilt Aşağı</b> (toplam ~20 sn)<br>
+    Piksel→servo doğrusal haritası çıkarılır. Otomatik kalibrasyon mümkün değilse kullan.
+  </div>
+  <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-ok" onclick="startM5()">▶ Başlat</button>
+    <button class="btn btn-danger" onclick="cancelM5()">✕ İptal</button>
+    <button class="btn btn-ok" id="m5-confirm-btn" style="display:none" onclick="confirmM5()">✓ Onayla ve Kaydet</button>
+  </div>
+  <div id="m5-step-info" style="margin-top:10px;font-size:13px;color:#7ab">Başlatılmadı.</div>
+  <div id="m5-result" style="font-size:12px;color:#555;margin-top:4px"></div>
 </div>
 
 <div class="card">
-  <h3>📁 Kalibrasyon Profilleri</h3>
-  <div class="steps">Beğendiğin anki kalibrasyonu isimle kaydet; listeden tek tıkla aktif et (canlı, restart gerekmez).</div>
-  <div style="margin-top:10px;display:flex;gap:8px">
-    <input id="profile-name" type="text" placeholder="profil adı" style="flex:1;padding:6px">
-    <button class="btn btn-ok" onclick="saveProfile()">💾 Mevcudu Kaydet</button>
+  <h3>Manuel Tek-Nokta (yalnızca offset)</h3>
+  <div class="steps">
+    1. Kalibrasyonu Başlat → sistem home konumuna gider, lazer açılır<br>
+    2. Hedefi <b>~150 cm</b> mesafeye koy (kağıt yüzeye lazer noktasını düşür)<br>
+    3. Aşağıdaki stream'de <b>lazer noktasının tam merkezine</b> tıkla<br>
+    4. Mesafeyi gir → Onayla ve Kaydet (yalnızca merkez offset öğrenir, ölçek sabit)
   </div>
-  <div id="profile-list" style="margin-top:10px">Yükleniyor…</div>
+</div>
+
+<div class="card">
+  <h3>Kontroller</h3>
+  <button class="btn btn-ok" onclick="startCalib()">▶ Kalibrasyonu Başlat</button>
+  <button class="btn btn-danger" onclick="cancelCalib()">✕ İptal</button>
+  <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
+    <label style="font-size:13px;color:#888">Mesafe (cm):</label>
+    <input id="dist" type="number" value="150" min="30" max="500">
+    <button class="btn btn-ok" onclick="doConfirm()">✓ Onayla ve Kaydet</button>
+  </div>
+  <div id="info" style="margin-top:10px">Henüz başlatılmadı.</div>
+</div>
+
+<div class="card">
+  <h3>Canlı Stream — Lazer Noktasına Tıkla</h3>
+  <div id="stream-wrap">
+    <img id="stream" src="/stream.mjpg" onclick="onStreamClick(event)"/>
+    <div id="marker"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Mevcut Kalibrasyon</h3>
+  <div id="cal-status">Yükleniyor...</div>
 </div>
 
 </div>
@@ -1562,6 +2226,121 @@ function fetchJson(url, options){
   })
 }
 
+function updateM5UI(){
+  const si=document.getElementById('m5-step-info')
+  const cb=document.getElementById('m5-confirm-btn')
+  if(m5Active&&m5Step<M5_TOTAL){
+    si.textContent='Adım '+(m5Step+1)+'/'+M5_TOTAL+': '+M5_LABELS[m5Step]+' — servo hareket etti, lazer noktasına tıkla'
+    cb.style.display='none'
+  }else if(m5Active&&m5Step>=M5_TOTAL){
+    si.textContent='Tüm '+M5_TOTAL+' nokta toplandı — "Onayla ve Kaydet" düğmesine bas'
+    cb.style.display='inline-block'
+  }else{
+    si.textContent='Başlatılmadı.'
+    cb.style.display='none'
+  }
+}
+function startM5(){
+  fetchJson('/calibrate/manual5/start',{method:'POST'}).then(d=>{
+    if(d.status==='error'){document.getElementById('m5-result').textContent='Hata: '+d.msg;return}
+    m5Active=true;m5Step=0
+    document.getElementById('m5-result').textContent=''
+    updateM5UI()
+  }).catch(err=>{
+    document.getElementById('m5-result').textContent='Hata: '+String(err)
+  })
+}
+function cancelM5(){
+  fetchJson('/calibrate/manual5/cancel',{method:'POST'}).then(()=>{
+    m5Active=false;updateM5UI()
+    document.getElementById('m5-result').textContent='İptal edildi.'
+    refreshStatus()
+  }).catch(err=>{
+    document.getElementById('m5-result').textContent='Hata: '+String(err)
+  })
+}
+function confirmM5(){
+  fetchJson('/calibrate/manual5/confirm',{method:'POST'}).then(d=>{
+    m5Active=false;updateM5UI()
+    const el=document.getElementById('m5-result')
+    if(d.status==='calibrated')
+      el.textContent='✓ Kaydedildi: rms='+d.rms_pan.toFixed(2)+'°/'+d.rms_tilt.toFixed(2)+'° reproj='+d.reproj.toFixed(1)+'px'
+    else if(d.status==='warning')
+      el.textContent='⚠ '+d.msg
+    else
+      el.textContent='Hata: '+(d.msg||'bilinmeyen')
+    refreshStatus()
+  }).catch(err=>{
+    document.getElementById('m5-result').textContent='Hata: '+String(err)
+  })
+}
+function startCalib(){
+  fetchJson('/calibrate/start',{method:'POST'}).then(()=>{
+    document.getElementById('info').textContent="Lazer açık. Sistem home konumunda; stream'de lazer noktasına tıklayın."
+    refreshStatus()
+  }).catch(err=>{
+    document.getElementById('info').textContent='Hata: '+String(err)
+  })
+}
+function onStreamClick(e){
+  const img=document.getElementById('stream')
+  const r=img.getBoundingClientRect()
+  const rx=Math.round((e.clientX-r.left)*(img.naturalWidth/r.width))
+  const ry=Math.round((e.clientY-r.top)*(img.naturalHeight/r.height))
+  if(m5Active&&m5Step<M5_TOTAL){
+    fetchJson('/calibrate/manual5/click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:rx,y:ry})})
+    .then(d=>{
+      if(d.status==='next_step'){m5Step++;updateM5UI()}
+      else if(d.status==='all_done'){m5Step=M5_TOTAL;updateM5UI()}
+      else if(d.status==='error')document.getElementById('m5-result').textContent='Hata: '+d.msg
+    })
+    .catch(err=>{
+      document.getElementById('m5-result').textContent='Hata: '+String(err)
+    })
+    return
+  }
+  clickX=rx;clickY=ry
+  const m=document.getElementById('marker')
+  m.style.left=(e.clientX-r.left)+'px';m.style.top=(e.clientY-r.top)+'px';m.style.display='block'
+  document.getElementById('info').textContent='Seçilen: ('+clickX+', '+clickY+') px — Onayla ya da farklı noktaya tıkla.'
+  fetchJson('/calibrate/click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x:clickX,y:clickY})})
+    .catch(err=>{
+      document.getElementById('info').textContent='Hata: '+String(err)
+    })
+}
+function doConfirm(){
+  if(clickX===null){alert('Önce lazer noktasına tıklayın.');return}
+  const dist=parseInt(document.getElementById('dist').value)||150
+  fetchJson('/calibrate/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({distance_cm:dist})})
+  .then(d=>{
+    document.getElementById('info').textContent=d.status==='error'?'Hata: '+d.msg
+      :'✓ Kaydedildi! offset=('+d.offset_px_x+', '+d.offset_px_y+')px @ '+d.distance_cm+'cm'
+    refreshStatus()
+  }).catch(err=>{
+    document.getElementById('info').textContent='Hata: '+String(err)
+  })
+}
+function cancelCalib(){
+  fetchJson('/calibrate/cancel',{method:'POST'}).then(()=>{
+    document.getElementById('info').textContent='İptal edildi.'
+    document.getElementById('marker').style.display='none'
+    clickX=null;clickY=null;refreshStatus()
+  }).catch(err=>{
+    document.getElementById('info').textContent='Hata: '+String(err)
+  })
+}
+function startAutoCalib(){
+  document.getElementById('auto-status').textContent='Başlatılıyor… servolar hareket edecek, bekleyin.'
+  fetchJson('/calibrate/auto',{method:'POST'}).then(d=>{
+    if(d.status==='already_running')
+      document.getElementById('auto-status').textContent='Zaten çalışıyor…'
+    else if(d.status==='error')
+      document.getElementById('auto-status').textContent='Hata: '+d.msg
+    refreshStatus()
+  }).catch(err=>{
+    document.getElementById('auto-status').textContent='Hata: '+String(err)
+  })
+}
 function setStaticBtn(on){
   const b=document.getElementById('static-btn')
   if(!b) return
@@ -1589,6 +2368,29 @@ function cancelHeliosCalib(){
     refreshStatus()
   }).catch(()=>{})
 }
+function startBoundaryCalib(){
+  document.getElementById('boundary-status').textContent='Başlatılıyor… önce sınırlar taranacak.'
+  document.getElementById('boundary-detail').textContent='faz: queued'
+  fetchJson('/calibrate/boundary/start',{method:'POST'}).then(d=>{
+    if(d.status==='already_running')
+      document.getElementById('boundary-status').textContent='Zaten çalışıyor…'
+    else if(d.status==='error')
+      document.getElementById('boundary-status').textContent='Hata: '+d.msg
+    refreshStatus()
+  }).catch(err=>{
+    document.getElementById('boundary-status').textContent='Hata: boundary kalibrasyon başlatılamadı'
+    document.getElementById('boundary-detail').textContent=String(err)
+  })
+}
+function cancelBoundaryCalib(){
+  fetchJson('/calibrate/boundary/cancel',{method:'POST'}).then(()=>{
+    document.getElementById('boundary-status').textContent='İptal edildi.'
+    refreshStatus()
+  }).catch(err=>{
+    document.getElementById('boundary-status').textContent='Hata: boundary kalibrasyon iptal edilemedi'
+    document.getElementById('boundary-detail').textContent=String(err)
+  })
+}
 function refreshStatus(){
   fetchJson('/calibrate/status').then(d=>{
     const ox=(d.laser_offset_px_x||0).toFixed(2),oy=(d.laser_offset_px_y||0).toFixed(2)
@@ -1598,53 +2400,37 @@ function refreshStatus(){
       +'<br>model: '+(d.model_type||'—')
       +'<br>'+(d.has_calibration_file?'dosya: var':'dosya: yok')
       +'<br>offset_px: ('+ox+', '+oy+')'
+    const a=document.getElementById('auto-status')
+    if(d.auto_cal_active) a.textContent='⏳ '+(d.auto_cal_status||'çalışıyor…')
+    else if(d.auto_cal_status) a.textContent=d.auto_cal_status
     const h=document.getElementById('helios-status')
     if(h){
       if(d.helios_cal_active) h.textContent='⏳ '+(d.helios_cal_status||'çalışıyor…')
       else if(d.helios_cal_status) h.textContent=d.helios_cal_status
     }
     setStaticBtn(d.static_test_active)
+    const b=document.getElementById('boundary-status')
+    const bd=document.getElementById('boundary-detail')
+    if(d.boundary_cal_active) b.textContent='⏳ '+(d.boundary_cal_status||'çalışıyor…')
+    else if(d.boundary_cal_status) b.textContent=d.boundary_cal_status
+    const snap=d.boundary_cal_snapshot||{}
+    const q=snap.quality||{}
+    bd.textContent=
+      'faz: '+(snap.phase||'—')
+      +'\\nyön: '+(snap.direction||'—')
+      +'\\nservo: pan '+((snap.pan===null||snap.pan===undefined)?'—':snap.pan)+'° tilt '+((snap.tilt===null||snap.tilt===undefined)?'—':snap.tilt)+'°'
+      +'\\nsınır: '+((snap.valid_boundary_points===null||snap.valid_boundary_points===undefined)?0:snap.valid_boundary_points)
+      +'\\nkabul/red: '+((snap.accepted_grid_samples===null||snap.accepted_grid_samples===undefined)?0:snap.accepted_grid_samples)+' / '+((snap.rejected_grid_samples===null||snap.rejected_grid_samples===undefined)?0:snap.rejected_grid_samples)
+      +'\\nson red: '+(snap.last_rejection_reason||'—')
+      +'\\nkalite: model='+(q.model_type||'—')+' rms='+((q.rms_pan_deg===null||q.rms_pan_deg===undefined)?'—':q.rms_pan_deg)+'/'+((q.rms_tilt_deg===null||q.rms_tilt_deg===undefined)?'—':q.rms_tilt_deg)
+      +' reproj='+((q.reprojection_error_px===null||q.reprojection_error_px===undefined)?'—':q.reprojection_error_px)
   }).catch(err=>{
     const msg='Kalibrasyon durumu alinamadi. Servis kapali olabilir veya endpoint hata veriyor: '+String(err)
     showCalError(msg)
+    document.getElementById('info').textContent=msg
   })
 }
-function saveProfile(){
-  const name=document.getElementById('profile-name').value.trim()
-  if(!name){return}
-  fetchJson('/calibrate/profile/save',{method:'POST',body:JSON.stringify({name:name})}).then(d=>{
-    if(d.status==='error'){alert(d.msg);return}
-    document.getElementById('profile-name').value=''
-    loadProfiles()
-  }).catch(()=>{})
-}
-function activateProfile(i){
-  const p=window._profiles[i]; if(!p)return
-  fetchJson('/calibrate/profile/activate',{method:'POST',body:JSON.stringify({name:p.name})}).then(d=>{
-    if(d.status==='error'){alert(d.msg);return}
-    loadProfiles(); refreshStatus()
-  }).catch(()=>{})
-}
-function deleteProfile(i){
-  const p=window._profiles[i]; if(!p)return
-  if(!confirm(p.name+' profili silinsin mi?'))return
-  fetchJson('/calibrate/profile/delete',{method:'POST',body:JSON.stringify({name:p.name})}).then(()=>loadProfiles()).catch(()=>{})
-}
-function loadProfiles(){
-  fetchJson('/calibrate/profiles').then(d=>{
-    window._profiles=d.profiles||[]
-    const el=document.getElementById('profile-list')
-    if(!window._profiles.length){el.innerHTML='<div style="color:#777;font-size:13px">Kayıtlı profil yok.</div>';return}
-    el.innerHTML=window._profiles.map(function(p,i){return ''
-      +'<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid #222">'
-      +'<div style="flex:1"><b>'+p.name+'</b>'+(p.active?' <span style="color:#2a7d46">● AKTİF</span>':'')
-      +'<br><span style="font-size:11px;color:#888">'+(p.model_type||'—')+' · n='+(p.n_samples||'—')+' · reproj='+(p.reprojection_error_px||'—')+'px · '+(p.calibrated_at||'')+'</span></div>'
-      +'<button class="btn btn-ok" onclick="activateProfile('+i+')">Aktif Et</button>'
-      +'<button class="btn btn-danger" onclick="deleteProfile('+i+')">Sil</button>'
-      +'</div>'}).join('')
-  }).catch(()=>{})
-}
-refreshStatus();setInterval(refreshStatus,1000);loadProfiles()
+refreshStatus();setInterval(refreshStatus,1000)
 </script></body></html>"""
 
 
@@ -1691,15 +2477,6 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
             self.end_headers()
             self.wfile.write(body)
 
-        def _read_json(self) -> dict:
-            try:
-                n = int(self.headers.get("Content-Length", 0))
-                if n <= 0:
-                    return {}
-                return _json.loads(self.rfile.read(n).decode("utf-8"))
-            except Exception:
-                return {}
-
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 self._send_page(PAGE)
@@ -1734,6 +2511,7 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 self._json_ok({
                     "laser_offset_px_x":  LASER_OFFSET_PX_X,
                     "laser_offset_px_y":  LASER_OFFSET_PX_Y,
+                    "calibrating":        calibrating,
                     "has_calibration_file": os.path.exists(CALIB_PATH),
                     "has_pixel_map":      HAS_PIXEL_MAP,
                     "model_type":        MAP_MODEL_TYPE,
@@ -1741,24 +2519,31 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                     "manual5_calibration": m5_flag,
                     "reachable_hull":    (REACHABLE_HULL.tolist()
                                            if REACHABLE_HULL is not None else []),
+                    "auto_cal_active":    auto_cal_active,
+                    "auto_cal_status":    auto_cal_status,
                     "helios_cal_active":  helios_cal_active,
                     "helios_cal_status":  helios_cal_status,
                     "static_test_active": static_test_active,
+                    "boundary_cal_active": boundary_cal_active,
+                    "boundary_cal_status": boundary_cal_status,
+                    "boundary_cal_snapshot": boundary_cal_snapshot,
+                    "manual5_active":    manual5_active,
+                    "manual5_step":      manual5_step,
                 })
-
-            elif self.path == "/calibrate/profiles":
-                self._json_ok({"profiles": _list_profiles()})
             else:
                 self.send_error(404)
 
         def do_POST(self):
-            global current_target_id, killed_flies
+            global calibrating, calib_click_px, current_target_id, killed_flies
             global LASER_OFFSET_PX_X, LASER_OFFSET_PX_Y
+            global auto_cal_active, auto_cal_status
+            global boundary_cal_active, boundary_cal_status, boundary_cal_snapshot
             global helios_cal_active, helios_cal_status
             global ACTIVE_MOVE_DURATION
             global static_test_active
             global target_pan_deg, target_tilt_deg
             global sim_laser_on
+            global manual5_active, manual5_step, manual5_clicks
 
             if self.path == "/laser/off":
                 with data_lock:
@@ -1772,7 +2557,7 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 self._json_ok({"status": "laser_off"})
 
             elif self.path == "/laser/on":
-                if helios_cal_active:
+                if calibrating or auto_cal_active or boundary_cal_active:
                     self._json_ok({"status": "error", "msg": "Kalibrasyon sırasında manuel lazer açılamaz"})
                     return
                 sim_laser_on = True
@@ -1788,16 +2573,126 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 log("[WEB] Hedef listesi sıfırlandı.")
                 self._json_ok({"status": "reset"})
 
+            elif self.path == "/calibrate/start":
+                if auto_cal_active or boundary_cal_active:
+                    self._json_ok({"status": "error", "msg": "Önce aktif otomatik kalibrasyonu iptal et"})
+                    return
+                with data_lock:
+                    auto_cal_active   = False
+                    auto_cal_status   = ""
+                    boundary_cal_active = False
+                    boundary_cal_status = ""
+                    boundary_cal_snapshot = {}
+                    calibrating       = True
+                    calib_click_px    = None
+                    current_target_id = None
+                    target_pan_deg    = PAN_HOME_DEG
+                    target_tilt_deg   = TILT_HOME_DEG
+                    sim_laser_on      = True
+                if HAS_GPIO and lazer:
+                    lazer.on()
+                log("[KALİBRASYON] Kalibrasyon modu başlatıldı.")
+                self._json_ok({"status": "calibrating"})
+
+            elif self.path == "/calibrate/click":
+                if not calibrating or auto_cal_active or boundary_cal_active:
+                    self._json_ok({"status": "error", "msg": "Manuel kalibrasyon aktif değil"})
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                body   = _json.loads(self.rfile.read(length))
+                with data_lock:
+                    calib_click_px = (float(body["x"]), float(body["y"]))
+                self._json_ok({"status": "click_received", "x": body["x"], "y": body["y"]})
+
+            elif self.path == "/calibrate/confirm":
+                if not calibrating or auto_cal_active or boundary_cal_active:
+                    self._json_ok({"status": "error", "msg": "Onay için manuel kalibrasyon aktif olmalı"})
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                body   = _json.loads(self.rfile.read(length)) if length else {}
+                distance_cm = int(body.get("distance_cm", 150))
+                with data_lock:
+                    click       = calib_click_px
+                    calibrating = False
+                    sim_laser_on = False
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                if click is None:
+                    self._json_ok({"status": "error", "msg": "Önce lazer noktasına tıkla"})
+                    return
+                proc_x   = click[0] * (PROCESS_W / CAPTURE_W)
+                proc_y   = click[1] * (PROCESS_H / CAPTURE_H)
+                offset_x = proc_x - PROCESS_W / 2
+                offset_y = proc_y - PROCESS_H / 2
+                _save_calibration(offset_x, offset_y, distance_cm)
+                LASER_OFFSET_PX_X = offset_x
+                LASER_OFFSET_PX_Y = offset_y
+                self._json_ok({
+                    "status":      "calibrated",
+                    "offset_px_x": round(offset_x, 1),
+                    "offset_px_y": round(offset_y, 1),
+                    "distance_cm": distance_cm,
+                })
+
+            elif self.path == "/calibrate/cancel":
+                with data_lock:
+                    calibrating     = False
+                    calib_click_px  = None
+                    auto_cal_active = False
+                    auto_cal_status = "İptal edildi."
+                    boundary_cal_active = False
+                    boundary_cal_status = "İptal edildi."
+                    boundary_cal_snapshot = {}
+                    target_pan_deg  = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                    sim_laser_on    = False
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                log("[KALİBRASYON] İptal edildi.")
+                self._json_ok({"status": "cancelled"})
+
+            elif self.path == "/calibrate/auto":
+                if calibrating or boundary_cal_active or helios_cal_active:
+                    self._json_ok({"status": "error", "msg": "Önce diğer kalibrasyonu iptal et"})
+                    return
+                if auto_cal_active:
+                    self._json_ok({"status": "already_running"})
+                    return
+                with data_lock:
+                    calibrating       = False   # manuel mod ile çakışmasın
+                    calib_click_px    = None
+                    current_target_id = None
+                    target_pan_deg    = PAN_HOME_DEG
+                    target_tilt_deg   = TILT_HOME_DEG
+                    auto_cal_active   = True
+                    auto_cal_status   = "Başlatılıyor…"
+                    boundary_cal_active = False
+                    boundary_cal_status = ""
+                    boundary_cal_snapshot = {}
+                    sim_laser_on      = False
+                log("[OTO-KALİBRASYON] Web'den başlatıldı.")
+                self._json_ok({"status": "auto_calibrating"})
+
             elif self.path == "/calibrate/helios":
+                if calibrating or auto_cal_active or boundary_cal_active:
+                    self._json_ok({"status": "error", "msg": "Önce diğer kalibrasyonu iptal et"})
+                    return
                 if helios_cal_active:
                     self._json_ok({"status": "already_running"})
                     return
                 with data_lock:
+                    calibrating         = False
+                    calib_click_px      = None
                     current_target_id   = None
                     target_pan_deg      = PAN_HOME_DEG
                     target_tilt_deg     = TILT_HOME_DEG
                     helios_cal_active   = True
                     helios_cal_status   = "Başlatılıyor…"
+                    auto_cal_active     = False
+                    auto_cal_status     = ""
+                    boundary_cal_active = False
+                    boundary_cal_status = ""
+                    boundary_cal_snapshot = {}
                     sim_laser_on        = False
                 if HAS_GPIO and lazer:
                     lazer.off()
@@ -1808,6 +2703,7 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 with data_lock:
                     helios_cal_active = False
                     helios_cal_status = "İptal edildi."
+                    calibrating = False
                     sim_laser_on = False
                     target_pan_deg = PAN_HOME_DEG
                     target_tilt_deg = TILT_HOME_DEG
@@ -1823,36 +2719,170 @@ def make_handler(buf_main: FrameBuffer, buf_debug: FrameBuffer):
                 log(f"[STATİK TEST] {'AÇIK' if static_test_active else 'KAPALI'}")
                 self._json_ok({"status": "ok", "active": static_test_active})
 
-            elif self.path == "/calibrate/profile/save":
-                name = _sanitize_profile_name(self._read_json().get("name", ""))
-                if not name:
-                    self._json_ok({"status": "error", "msg": "Geçersiz isim"}); return
-                if not os.path.exists(CALIB_PATH):
-                    self._json_ok({"status": "error", "msg": "Aktif kalibrasyon yok"}); return
-                os.makedirs(PROFILES_DIR, exist_ok=True)
-                with open(CALIB_PATH) as src, open(_profile_path(name), "w") as dst:
-                    dst.write(src.read())
-                log(f"[PROFİL] Kaydedildi: {name}")
-                self._json_ok({"status": "ok", "name": name})
+            elif self.path == "/calibrate/boundary/start":
+                if calibrating or auto_cal_active or helios_cal_active:
+                    self._json_ok({"status": "error", "msg": "Önce diğer kalibrasyonu iptal et"})
+                    return
+                if boundary_cal_active:
+                    self._json_ok({"status": "already_running"})
+                    return
+                with data_lock:
+                    calibrating = False
+                    calib_click_px = None
+                    manual5_active = False
+                    manual5_step = 0
+                    manual5_clicks = []
+                    current_target_id = None
+                    target_pan_deg = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                    auto_cal_active = False
+                    auto_cal_status = ""
+                    boundary_cal_active = True
+                    boundary_cal_status = "Başlatılıyor…"
+                    boundary_cal_snapshot = {}
+                    sim_laser_on = False
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                log("[BOUNDARY+GRID] Web'den başlatıldı.")
+                self._json_ok({"status": "boundary_calibrating"})
 
-            elif self.path == "/calibrate/profile/activate":
-                name = _sanitize_profile_name(self._read_json().get("name", ""))
-                path = _profile_path(name)
-                if not name or not os.path.exists(path):
-                    self._json_ok({"status": "error", "msg": "Profil bulunamadı"}); return
-                with open(path) as src, open(CALIB_PATH, "w") as dst:
-                    dst.write(src.read())
-                _load_calibration()
-                log(f"[PROFİL] Aktif edildi: {name} (harita={HAS_PIXEL_MAP})")
-                self._json_ok({"status": "ok", "name": name, "has_pixel_map": HAS_PIXEL_MAP})
+            elif self.path == "/calibrate/boundary/cancel":
+                with data_lock:
+                    boundary_cal_active = False
+                    boundary_cal_status = "İptal edildi."
+                    boundary_cal_snapshot = {}
+                    auto_cal_status = ""
+                    calibrating = False
+                    sim_laser_on = False
+                    target_pan_deg = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                log("[BOUNDARY+GRID] İptal edildi.")
+                self._json_ok({"status": "cancelled"})
 
-            elif self.path == "/calibrate/profile/delete":
-                name = _sanitize_profile_name(self._read_json().get("name", ""))
-                path = _profile_path(name)
-                if name and os.path.exists(path):
-                    os.remove(path)
-                    log(f"[PROFİL] Silindi: {name}")
-                self._json_ok({"status": "ok"})
+            elif self.path == "/calibrate/manual5/start":
+                if auto_cal_active or boundary_cal_active:
+                    self._json_ok({"status": "error", "msg": "Önce otomatik kalibrasyonu iptal et"})
+                    return
+                positions = _manual5_positions()
+                p0, t0 = positions[0]
+                with data_lock:
+                    calibrating      = True
+                    calib_click_px   = None
+                    auto_cal_active  = False
+                    boundary_cal_active = False
+                    boundary_cal_status = ""
+                    boundary_cal_snapshot = {}
+                    manual5_active   = True
+                    manual5_step     = 0
+                    manual5_clicks   = []
+                    current_target_id = None
+                    target_pan_deg   = p0
+                    target_tilt_deg  = t0
+                    sim_laser_on     = True
+                if HAS_GPIO and lazer:
+                    lazer.on()
+                log(f"[5-NOKTA KAL] Başlatıldı. Adım 1/5: {MANUAL5_LABELS[0]} "
+                    f"pan={p0:.1f}° tilt={t0:.1f}°")
+                self._json_ok({"status": "manual5_started", "step": 0,
+                               "label": MANUAL5_LABELS[0]})
+
+            elif self.path == "/calibrate/manual5/click":
+                if not manual5_active:
+                    self._json_ok({"status": "error", "msg": "5-nokta kalibrasyon aktif değil"})
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                body = _json.loads(self.rfile.read(length))
+                cx = float(body["x"]) * (PROCESS_W / CAPTURE_W)
+                cy = float(body["y"]) * (PROCESS_H / CAPTURE_H)
+                positions = _manual5_positions()
+                with data_lock:
+                    step = manual5_step
+                    if step >= len(positions):
+                        self._json_ok({"status": "error", "msg": "Zaten tüm noktalar toplandı"})
+                        return
+                    p, t = positions[step]
+                    manual5_clicks.append({
+                        "pan":    round(p, 4),
+                        "tilt":   round(t, 4),
+                        "px":     round(cx, 3),
+                        "py":     round(cy, 3),
+                        "weight": 1.0,
+                    })
+                    manual5_step += 1
+                    new_step = manual5_step
+                    if new_step < len(positions):
+                        np_, nt = positions[new_step]
+                        target_pan_deg  = np_
+                        target_tilt_deg = nt
+                log(f"[5-NOKTA KAL] Adım {step+1}/5 kaydedildi: "
+                    f"pan={p:.1f}° tilt={t:.1f}° px=({cx:.1f},{cy:.1f})")
+                if new_step < len(positions):
+                    log(f"[5-NOKTA KAL] Adım {new_step+1}/5: {MANUAL5_LABELS[new_step]} "
+                        f"pan={positions[new_step][0]:.1f}° tilt={positions[new_step][1]:.1f}°")
+                    self._json_ok({"status": "next_step", "step": new_step,
+                                   "label": MANUAL5_LABELS[new_step]})
+                else:
+                    self._json_ok({"status": "all_done", "step": new_step})
+
+            elif self.path == "/calibrate/manual5/confirm":
+                if not manual5_active:
+                    self._json_ok({"status": "error", "msg": "5-nokta kalibrasyon aktif değil"})
+                    return
+                with data_lock:
+                    clicks = list(manual5_clicks)
+                    step = manual5_step
+                if step < len(_manual5_positions()):
+                    self._json_ok({"status": "error",
+                                   "msg": f"Sadece {step}/5 nokta tıklandı"})
+                    return
+                with data_lock:
+                    manual5_active  = False
+                    calibrating     = False
+                    sim_laser_on    = False
+                    target_pan_deg  = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                result = _fit_pixel_to_servo(clicks)
+                if result is None:
+                    self._json_ok({"status": "error",
+                                   "msg": "Fit oluşturulamadı — en az 3 nokta gerekli"})
+                    return
+                _save_pixel_map(result, manual5=True)
+                usable, reason = _is_pixel_map_usable(result)
+                if usable:
+                    self._json_ok({
+                        "status":    "calibrated",
+                        "model_type": result["model_type"],
+                        "rms_pan":   result["rms_pan_deg"],
+                        "rms_tilt":  result["rms_tilt_deg"],
+                        "reproj":    result["reprojection_error_px"],
+                    })
+                else:
+                    self._json_ok({
+                        "status": "warning",
+                        "msg": f"Kaydedildi ama kalite düşük: {reason}",
+                        "model_type": result["model_type"],
+                        "rms_pan":   result["rms_pan_deg"],
+                        "rms_tilt":  result["rms_tilt_deg"],
+                        "reproj":    result["reprojection_error_px"],
+                    })
+
+            elif self.path == "/calibrate/manual5/cancel":
+                with data_lock:
+                    manual5_active  = False
+                    manual5_step    = 0
+                    manual5_clicks  = []
+                    calibrating     = False
+                    sim_laser_on    = False
+                    target_pan_deg  = PAN_HOME_DEG
+                    target_tilt_deg = TILT_HOME_DEG
+                if HAS_GPIO and lazer:
+                    lazer.off()
+                log("[5-NOKTA KAL] İptal edildi.")
+                self._json_ok({"status": "cancelled"})
 
             else:
                 self.send_error(404)
@@ -1973,7 +3003,7 @@ def motor_smooth_thread():
 
         # Kalibrasyon sırasında DETACH ETME: enerji kesilince servo tutma torkunu
         # kaybedip yerçekimiyle başka yere düşer ("saçma yere dönme") ve ölçüm bozulur.
-        cal_active = helios_cal_active
+        cal_active = helios_cal_active or auto_cal_active or boundary_cal_active
         if pan_active and not cal_active:
             pan_servo.detach()
             pan_active = False
@@ -1990,6 +3020,8 @@ def motor_smooth_thread():
 def main(argv=None) -> None:
     global current_target_id, lock_start_time, target_pan_deg, target_tilt_deg, is_running
     global pan_servo, tilt_servo, lazer
+    global auto_cal_active, auto_cal_status
+    global boundary_cal_active, boundary_cal_status, boundary_cal_snapshot
     global helios_cal_active, helios_cal_status
     global ACTIVE_MOVE_DURATION
     global sim_laser_on
@@ -2115,6 +3147,8 @@ def main(argv=None) -> None:
 
     frame_idx = 0
     exposure_settle = 0          # >0 ise pozlama yeni değişti, frame-diff'i bu kadar frame susturmak için
+    auto_cal = None              # AutoCalibrator instance (aktifken)
+    boundary_cal = None          # BoundaryGridCalibrator instance (aktifken)
     helios_cal = None            # HeliosCalibrator instance (aktifken)
     last_trigger = 0.0
     lock_visible_time = 0.0      # kilitli hedef frame'de gerçekten görülürken biriken süre
@@ -2153,9 +3187,93 @@ def main(argv=None) -> None:
                 continue
 
             # İptal/bitiş sonrası bayat instance kalmasın — sonraki başlatma temiz olsun
+            if not auto_cal_active and auto_cal is not None:
+                auto_cal = None
+            if not boundary_cal_active and boundary_cal is not None:
+                boundary_cal = None
             if not helios_cal_active and helios_cal is not None:
                 helios_cal.close("iptal/durdurma")
                 helios_cal = None
+
+            if boundary_cal_active:
+                tracker.tracks.clear()
+                if boundary_cal is None:
+                    boundary_cal = BoundaryGridCalibrator()
+                    log("[BOUNDARY+GRID] Başladı.")
+                cmd = boundary_cal.update(small)
+
+                with data_lock:
+                    target_pan_deg = cmd["pan"]
+                    target_tilt_deg = cmd["tilt"]
+                    sim_laser_on = bool(cmd.get("laser"))
+                    boundary_cal_snapshot = cmd.get("snapshot", {})
+                if HAS_GPIO and lazer:
+                    lazer.on() if cmd.get("laser") else lazer.off()
+
+                if enable_stream:
+                    overlay = frame.copy()
+                    dot = boundary_cal.last_dot or _detect_laser_dot(small, boundary_cal.ref)
+                    if dot is not None:
+                        cv2.drawMarker(overlay, (int(dot[0] * sx), int(dot[1] * sy)),
+                                       (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
+                    for (px, py, _a) in boundary_cal.dot_samples:
+                        cv2.circle(overlay, (int(px * sx), int(py * sy)), 2, (0, 180, 255), -1)
+                    for sample in boundary_cal.boundary_samples:
+                        cv2.circle(overlay, (int(sample["px"] * sx), int(sample["py"] * sy)),
+                                   4, (255, 200, 0), -1)
+                    for point in boundary_cal.boundary_points.values():
+                        cv2.drawMarker(overlay, (int(point["px"] * sx), int(point["py"] * sy)),
+                                       (255, 0, 255), cv2.MARKER_DIAMOND, 18, 2)
+                    if boundary_cal.safe_area is not None:
+                        poly = np.asarray(
+                            [[int(x * sx), int(y * sy)] for x, y in boundary_cal.safe_area["safe_polygon"]],
+                            dtype=np.int32,
+                        ).reshape(-1, 1, 2)
+                        cv2.polylines(overlay, [poly], True, (255, 255, 0), 2, cv2.LINE_AA)
+                    for plan in boundary_cal.grid_plan:
+                        cv2.circle(overlay, (int(plan["planned_px"] * sx), int(plan["planned_py"] * sy)),
+                                   3, (255, 255, 0), 1)
+                    for sample in boundary_cal.samples:
+                        cv2.circle(overlay, (int(sample["px"] * sx), int(sample["py"] * sy)),
+                                   4, (0, 255, 0), -1)
+                    for sample in boundary_cal.rejected_samples:
+                        if "px" in sample and "py" in sample:
+                            cv2.drawMarker(overlay, (int(sample["px"] * sx), int(sample["py"] * sy)),
+                                           (0, 0, 255), cv2.MARKER_TILTED_CROSS, 18, 2)
+                    cv2.putText(overlay, "BOUNDARY+GRID: " + cmd["status"], (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 220, 255), 2, cv2.LINE_AA)
+                    ok, jpg = cv2.imencode(".jpg", overlay, encode)
+                    if ok:
+                        buf_main.update(jpg.tobytes())
+
+                if cmd.get("done"):
+                    res = cmd.get("result")
+                    usable, reason = _is_pixel_map_usable(res)
+                    if usable:
+                        _save_pixel_map(res, mode="boundary_grid")
+                        boundary_cal_status = (
+                            f"Tamamlandı — {res['model_type']}, {res['n_samples']} nokta, "
+                            f"rms {res['rms_pan_deg']}/{res['rms_tilt_deg']}°, "
+                            f"reproj {res['reprojection_error_px']}px"
+                        )
+                    else:
+                        if res is None:
+                            reason = boundary_cal.status.replace("BAŞARISIZ — ", "")
+                        boundary_cal_status = f"BAŞARISIZ — {reason}"
+                        log(f"[BOUNDARY+GRID] Başarısız: {reason}.")
+                    boundary_cal_active = False
+                    boundary_cal = None
+                    sim_laser_on = False
+                    if HAS_GPIO and lazer:
+                        lazer.off()
+                    with data_lock:
+                        target_pan_deg = PAN_HOME_DEG
+                        target_tilt_deg = TILT_HOME_DEG
+                else:
+                    boundary_cal_status = cmd["status"]
+
+                frame_idx += 1
+                continue
 
             # OTOMATİK KALİBRASYON MODU — servoları gezdirip lazer noktasıyla harita fit eder
             if helios_cal_active:
@@ -2241,6 +3359,95 @@ def main(argv=None) -> None:
                 else:
                     helios_cal_status = cmd["status"]
 
+                frame_idx += 1
+                continue
+
+            if auto_cal_active:
+                if auto_cal is None:
+                    auto_cal = AutoCalibrator()
+                    log("[OTO-KALİBRASYON] Başladı.")
+                cmd = auto_cal.update(small)
+
+                if "pan" in cmd:
+                    with data_lock:
+                        target_pan_deg  = cmd["pan"]
+                        target_tilt_deg = cmd["tilt"]
+                        sim_laser_on    = bool(cmd.get("laser"))
+                if HAS_GPIO and lazer:
+                    lazer.on() if cmd.get("laser") else lazer.off()
+
+                if enable_stream:
+                    overlay = frame.copy()
+                    dot = auto_cal.last_dot or _detect_laser_dot(small, auto_cal.ref)
+                    if dot is not None:
+                        cv2.drawMarker(overlay, (int(dot[0] * sx), int(dot[1] * sy)),
+                                       (0, 0, 255), cv2.MARKER_CROSS, 30, 2)
+                    for (px, py, _a) in auto_cal.dot_samples:
+                        cv2.circle(overlay, (int(px * sx), int(py * sy)), 2, (0, 180, 255), -1)
+                    for sample in auto_cal.samples:
+                        cv2.circle(
+                            overlay,
+                            (int(sample["px"] * sx), int(sample["py"] * sy)),
+                            3, (0, 255, 0), -1,
+                        )
+                    cv2.putText(overlay, "OTO-KALIBRASYON: " + cmd["status"], (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+                    ok, jpg = cv2.imencode(".jpg", overlay, encode)
+                    if ok:
+                        buf_main.update(jpg.tobytes())
+
+                if cmd.get("done"):
+                    res = cmd.get("result")
+                    usable, reason = _is_pixel_map_usable(res)
+                    if usable:
+                        _save_pixel_map(res)
+                        auto_cal_status = (
+                            f"Tamamlandı — {res['model_type']}, {res['n_samples']} nokta, "
+                            f"rms {res['rms_pan_deg']}/{res['rms_tilt_deg']}°, "
+                            f"reproj {res['reprojection_error_px']}px"
+                        )
+                    else:
+                        auto_cal_status = f"BAŞARISIZ — {reason}"
+                        log(f"[OTO-KALİBRASYON] Başarısız: {reason}.")
+                    auto_cal_active = False
+                    auto_cal = None
+                    sim_laser_on = False
+                    if HAS_GPIO and lazer:
+                        lazer.off()
+                    with data_lock:
+                        target_pan_deg  = PAN_HOME_DEG
+                        target_tilt_deg = TILT_HOME_DEG
+                else:
+                    auto_cal_status = cmd["status"]
+
+                frame_idx += 1
+                continue
+
+            # KALIBRASYON MODU — detection ve tracking duraklatılır
+            if calibrating:
+                tracker.tracks.clear()
+                overlay = frame.copy()
+                cv2.drawMarker(overlay, (CAPTURE_W // 2, CAPTURE_H // 2),
+                               (0, 255, 255), cv2.MARKER_CROSS, 40, 2)
+                if manual5_active:
+                    step5 = manual5_step
+                    label5 = MANUAL5_LABELS[step5] if step5 < len(MANUAL5_LABELS) else "Tamamlandı"
+                    msg5 = f"5-NOKTA KAL [{step5+1 if step5 < 5 else 5}/5]: {label5} — lazer noktasina tikla"
+                    cv2.putText(overlay, msg5, (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(overlay, "KALIBRASYON — Lazer noktasina tiklayin",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 255, 255), 2, cv2.LINE_AA)
+                with data_lock:
+                    click = calib_click_px
+                if click is not None:
+                    cv2.drawMarker(overlay, (int(click[0]), int(click[1])),
+                                   (0, 0, 255), cv2.MARKER_TILTED_CROSS, 30, 2)
+                if enable_stream:
+                    ok, jpg = cv2.imencode(".jpg", overlay, encode)
+                    if ok:
+                        buf_main.update(jpg.tobytes())
                 frame_idx += 1
                 continue
 
@@ -2466,8 +3673,13 @@ def main(argv=None) -> None:
                     "killed":    len(killed_flies),
                     "pan_deg":   round(current_pan_deg, 1),
                     "tilt_deg":  round(current_tilt_deg, 1),
+                    "calibrating": calibrating,
                     "static_test_active": static_test_active,
-                    "mode": ("helios_cal" if helios_cal_active else "run"),
+                    "auto_cal_active": auto_cal_active,
+                    "boundary_cal_active": boundary_cal_active,
+                    "mode": ("boundary_cal" if boundary_cal_active else
+                             ("auto_cal" if auto_cal_active else
+                              ("manual_cal" if calibrating else "run"))),
                     "dry_run": dry_run,
                     "suppressed": suppressed,
                     "target_misses": target_misses,
