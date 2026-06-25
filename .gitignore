@@ -45,3 +45,7 @@ kerem/
 .local/share/claude/
 
 LaserPointerMotionDetection/
+
+# Helios kalibrasyon logları (LLM debug için, repoya girmesin)
+v2/logs/
+*.log

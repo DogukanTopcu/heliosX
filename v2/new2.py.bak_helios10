@@ -186,7 +186,7 @@ AUTOCAL_MIN_OBSERVATIONS = 5
 AUTOCAL_GOOD_JITTER_PX = 6.0
 AUTOCAL_MAX_JITTER_PX = 10.0
 LASER_RED_MIN      = 45     # kırmızı baskınlık eşiği (R - max(G,B)), referanssız önizleme
-LASER_DIFF_MIN     = 25     # lazer açık-kapalı parlaklık farkı eşiği (soluk köşe noktaları da yakalansın; eski 40)
+LASER_DIFF_MIN     = 40     # lazer açık-kapalı parlaklık farkı eşiği (doygun nokta da yakalanır)
 LASER_MIN_AREA     = 2      # px², bu alandan küçük lekeler yok sayılır
 AUTOCAL_MIN_SAMPLES = 18
 HELIOS_MIN_SAMPLES = 9   # helios: 9-nokta sınır kalibrasyonu
@@ -785,8 +785,6 @@ class HeliosCalibrator:
         self.result = None
         self.dot_samples: list = []
         self.last_dot = None
-        self.diag_maxscore = 0   # ölçüm penceresinde görülen en yüksek tespit skoru
-        self.diag_nabove = 0     # eşiği geçen en yüksek piksel sayısı
         self.logf = None
         self._setup_log()
         self._log("BAŞLADI — tam tarama ısıtması")
@@ -851,18 +849,6 @@ class HeliosCalibrator:
                 pass
             self.logf = None
 
-    def _diag_score(self, small_bgr):
-        """_detect_laser_dot ile AYNI skoru hesaplar (teşhis için):
-        (max_score, eşik_üstü_piksel_sayısı)."""
-        if self.ref is None:
-            return 0, 0
-        diff = cv2.absdiff(small_bgr, self.ref)
-        bright = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY).astype(np.int16)
-        b, g, r = cv2.split(diff.astype(np.int16))
-        redness = np.clip(r - np.maximum(g, b), 0, 255)
-        score = np.clip(bright + redness, 0, 255)
-        return int(score.max()), int((score >= LASER_DIFF_MIN).sum())
-
     def _arrived(self, p: float, t: float) -> bool:
         return abs(current_pan_deg - p) <= 0.15 and abs(current_tilt_deg - t) <= 0.15
 
@@ -916,8 +902,6 @@ class HeliosCalibrator:
             self.phase = "measure"
             self.counter = HELIOS_MEASURE_FR
             self.dot_samples = []
-            self.diag_maxscore = 0
-            self.diag_nabove = 0
             self.status = f"Nokta {self.i + 1}/{n} ({self.labels[self.i]}) ölçülüyor"
             self._log(f"Nokta {self.i + 1}/{n} ({self.labels[self.i]}): VARILDI pan={p:.1f} tilt={t:.1f} -> ölçüm")
             return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
@@ -928,11 +912,6 @@ class HeliosCalibrator:
             if dot is not None:
                 self.dot_samples.append(dot)
                 self.last_dot = dot
-            mx, nab = self._diag_score(small_bgr)
-            if mx > self.diag_maxscore:
-                self.diag_maxscore = mx
-            if nab > self.diag_nabove:
-                self.diag_nabove = nab
             self.counter -= 1
             if self.counter > 0:
                 return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
@@ -947,13 +926,10 @@ class HeliosCalibrator:
                 })
                 self._log(f"[HELIOS] {self.i + 1}/{n} {self.labels[self.i]} KABUL: "
                           f"px=({summary['px']:.1f},{summary['py']:.1f}) area={summary['area']:.1f} "
-                          f"jitter={summary['jitter_px']:.1f}px w={summary['weight']:.2f} obs={obs}/{HELIOS_MEASURE_FR} "
-                          f"diag(maxscore={self.diag_maxscore} nabove={self.diag_nabove} thr={LASER_DIFF_MIN} minarea={LASER_MIN_AREA})")
+                          f"jitter={summary['jitter_px']:.1f}px w={summary['weight']:.2f} obs={obs}/{HELIOS_MEASURE_FR}")
             else:
                 self._log(f"[HELIOS] {self.i + 1}/{n} {self.labels[self.i]} RED: {err or 'bilinmeyen'} "
-                          f"(obs={obs}/{HELIOS_MEASURE_FR}) "
-                          f"diag(maxscore={self.diag_maxscore} nabove={self.diag_nabove} thr={LASER_DIFF_MIN} minarea={LASER_MIN_AREA})  "
-                          f"# maxscore<thr -> nokta soluk (eşik); maxscore>=thr & nabove az -> blob küçük (morfoloji)")
+                          f"(obs={obs}/{HELIOS_MEASURE_FR})  # obs=0 ise lazer görülmedi (FOV/poz/exposure?)")
             self.i += 1
             if self.i >= n:
                 self.phase = "done"

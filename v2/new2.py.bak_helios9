@@ -186,7 +186,7 @@ AUTOCAL_MIN_OBSERVATIONS = 5
 AUTOCAL_GOOD_JITTER_PX = 6.0
 AUTOCAL_MAX_JITTER_PX = 10.0
 LASER_RED_MIN      = 45     # kırmızı baskınlık eşiği (R - max(G,B)), referanssız önizleme
-LASER_DIFF_MIN     = 25     # lazer açık-kapalı parlaklık farkı eşiği (soluk köşe noktaları da yakalansın; eski 40)
+LASER_DIFF_MIN     = 40     # lazer açık-kapalı parlaklık farkı eşiği (doygun nokta da yakalanır)
 LASER_MIN_AREA     = 2      # px², bu alandan küçük lekeler yok sayılır
 AUTOCAL_MIN_SAMPLES = 18
 HELIOS_MIN_SAMPLES = 9   # helios: 9-nokta sınır kalibrasyonu
@@ -761,15 +761,21 @@ def _summarize_home_dot_samples(dots: list[tuple[float, float, float]]) -> tuple
 
 
 class HeliosCalibrator:
-    """Helios kalibrasyon: tam tarama (ısıtma) -> 9 noktada lazer ölçümü -> fit.
-    Faz ilerlemesi frame saymaya değil servonun VARMASINA bağlı (current_* == hedef).
-    Her run icin logs/helios_<zaman>.log dosyasina LLM-dostu detayli log yazar."""
+    """Helios kalibrasyon: önce tam pan+tilt taraması (mekanik/backlash ısıtma),
+    sonra 9 sabit noktada (orta + 8 sınır) lazer noktasını ölçüp pixel->servo
+    haritasını fit eder. Main loop her frame update() çağırır.
+    Hareket 'blocking' ve yavaş olduğundan, faz ilerlemesi frame saymaya değil
+    servonun gerçekten VARMASINA bağlıdır (current_* == hedef) — yoksa hızlı FPS'te
+    kalibratör servoyu geçip eski hedefleri kovalatır ('saçma yere dönme')."""
 
     def __init__(self) -> None:
         pmin, pmax = PAN_MIN_DEG, PAN_MAX_DEG
         tmin, tmax = TILT_MIN_DEG, TILT_MAX_DEG
+        # Tam tarama ısıtması (ölçüm yok): pan min->max->0, tilt min->max->0
         self.sweep = [(pmin, 0.0), (pmax, 0.0), (0.0, 0.0),
                       (0.0, tmin), (0.0, tmax), (0.0, 0.0)]
+        # 9 ölçüm noktası: orta, sağ orta, sağ üst, üst orta, sol üst,
+        # sol orta, sol alt, alt orta, sağ alt (tek eksen yürüyüş)
         self.grid = [(0.0, 0.0), (pmin, 0.0), (pmin, tmax), (0.0, tmax),
                      (pmax, tmax), (pmax, 0.0), (pmax, tmin), (0.0, tmin), (pmin, tmin)]
         self.labels = ["orta", "sağ orta", "sağ üst", "üst orta", "sol üst",
@@ -785,85 +791,9 @@ class HeliosCalibrator:
         self.result = None
         self.dot_samples: list = []
         self.last_dot = None
-        self.diag_maxscore = 0   # ölçüm penceresinde görülen en yüksek tespit skoru
-        self.diag_nabove = 0     # eşiği geçen en yüksek piksel sayısı
-        self.logf = None
-        self._setup_log()
-        self._log("BAŞLADI — tam tarama ısıtması")
-
-    # ---- LLM-dostu log ----
-    def _setup_log(self) -> None:
-        try:
-            os.makedirs("logs", exist_ok=True)
-            ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.logpath = os.path.join("logs", f"helios_{ts}.log")
-            self.logf = open(self.logpath, "w", encoding="utf-8")
-            self._write_header()
-            log(f"[HELIOS-KAL] Log: {self.logpath}")
-        except Exception as e:
-            self.logf = None
-            log(f"[HELIOS-KAL] Log açılamadı: {e}")
-
-    def _file(self, text: str) -> None:
-        if self.logf:
-            try:
-                self.logf.write(text + "\n")
-                self.logf.flush()
-            except Exception:
-                pass
-
-    def _log(self, msg: str) -> None:
-        log(msg)
-        self._file(_dt.datetime.now().strftime("%H:%M:%S.%f")[:-3] + "  " + msg)
-
-    def _write_header(self) -> None:
-        H = self._file
-        H("=== HELIOS KALİBRASYON LOG ===")
-        H("baslangic: " + _dt.datetime.now().isoformat(timespec="seconds"))
-        H("")
-        H("# Bu log bir LLM'e yapıştırılmak üzere yazıldı: önce tüm konfigürasyon,")
-        H("# sonra adım adım olaylar, hata olursa traceback. Sorun çözerken bunu paylaş.")
-        H("")
-        H("--- KONFİG (bağlam) ---")
-        H(f"pan_range_deg    = [{PAN_MIN_DEG}, {PAN_MAX_DEG}]  (0=fiziksel orta, zero_offset={PAN_ZERO_OFFSET})")
-        H(f"tilt_range_deg   = [{TILT_MIN_DEG}, {TILT_MAX_DEG}]  (zero_offset={TILT_ZERO_OFFSET})")
-        H(f"reversal_nudge   = pan {REVERSAL_NUDGE_PAN_DEG}° / tilt {REVERSAL_NUDGE_TILT_DEG}° (wind-up anti-backlash)")
-        H(f"move_duration    = {HELIOS_MOVE_DURATION}s (yavaş)  settle_fr={HELIOS_SETTLE_FR}  measure_fr={HELIOS_MEASURE_FR}")
-        H(f"process_res      = {PROCESS_W}x{PROCESS_H}  camera_fov_deg = {CAMERA_FOV_H_DEG}x{CAMERA_FOV_V_DEG}")
-        H(f"laser_detect     = diff_min={LASER_DIFF_MIN}  min_area={LASER_MIN_AREA}px²")
-        H(f"jitter_thresh_px = good={AUTOCAL_GOOD_JITTER_PX}  max={AUTOCAL_MAX_JITTER_PX}  min_obs={AUTOCAL_MIN_OBSERVATIONS}")
-        H(f"fit_gate         = min_samples={HELIOS_MIN_SAMPLES}  max_reproj_px={AUTOCAL_MAX_REPROJECTION_PX}")
-        H(f"grid(pan,tilt)   = {self.grid}")
-        H(f"labels           = {self.labels}")
-        H("")
-        H("--- OLAYLAR ---")
-
-    def close(self, note: str = "") -> None:
-        if self.logf:
-            try:
-                if note:
-                    self._file("SONLANMA: " + note)
-                self._file("ozet: " + str(len(self.samples)) + "/" + str(len(self.grid)) + " nokta ölçüldü")
-                self._file("bitis: " + _dt.datetime.now().isoformat(timespec="seconds"))
-                self._file("=== LOG SONU ===")
-                self.logf.close()
-            except Exception:
-                pass
-            self.logf = None
-
-    def _diag_score(self, small_bgr):
-        """_detect_laser_dot ile AYNI skoru hesaplar (teşhis için):
-        (max_score, eşik_üstü_piksel_sayısı)."""
-        if self.ref is None:
-            return 0, 0
-        diff = cv2.absdiff(small_bgr, self.ref)
-        bright = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY).astype(np.int16)
-        b, g, r = cv2.split(diff.astype(np.int16))
-        redness = np.clip(r - np.maximum(g, b), 0, 255)
-        score = np.clip(bright + redness, 0, 255)
-        return int(score.max()), int((score >= LASER_DIFF_MIN).sum())
 
     def _arrived(self, p: float, t: float) -> bool:
+        # current_pan_deg/current_tilt_deg motor_smooth_thread tarafından güncellenir
         return abs(current_pan_deg - p) <= 0.15 and abs(current_tilt_deg - t) <= 0.15
 
     def update(self, small_bgr) -> dict:
@@ -887,7 +817,6 @@ class HeliosCalibrator:
             self.counter = AUTOCAL_REF_FR
             self.ref_frames = []
             self.status = "Referans alınıyor (lazer kapalı)…"
-            self._log("Tam tarama bitti -> referans alınıyor (lazer kapalı)")
             return {"pan": 0.0, "tilt": 0.0, "laser": False, "done": False, "status": self.status}
 
         if self.phase == "ref":
@@ -901,7 +830,6 @@ class HeliosCalibrator:
                 self.dot_samples = []
                 p, t = self.grid[self.i]
                 self.status = f"Nokta 1/{n} ({self.labels[0]})"
-                self._log(f"Referans alındı ({AUTOCAL_REF_FR} frame) -> ölçüm noktaları başlıyor")
                 return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
             return {"pan": 0.0, "tilt": 0.0, "laser": False, "done": False, "status": self.status}
 
@@ -916,10 +844,7 @@ class HeliosCalibrator:
             self.phase = "measure"
             self.counter = HELIOS_MEASURE_FR
             self.dot_samples = []
-            self.diag_maxscore = 0
-            self.diag_nabove = 0
             self.status = f"Nokta {self.i + 1}/{n} ({self.labels[self.i]}) ölçülüyor"
-            self._log(f"Nokta {self.i + 1}/{n} ({self.labels[self.i]}): VARILDI pan={p:.1f} tilt={t:.1f} -> ölçüm")
             return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
 
         if self.phase == "measure":
@@ -928,15 +853,9 @@ class HeliosCalibrator:
             if dot is not None:
                 self.dot_samples.append(dot)
                 self.last_dot = dot
-            mx, nab = self._diag_score(small_bgr)
-            if mx > self.diag_maxscore:
-                self.diag_maxscore = mx
-            if nab > self.diag_nabove:
-                self.diag_nabove = nab
             self.counter -= 1
             if self.counter > 0:
                 return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
-            obs = len(self.dot_samples)
             summary, err = _summarize_dot_samples(self.dot_samples)
             if summary is not None:
                 self.samples.append({
@@ -945,26 +864,14 @@ class HeliosCalibrator:
                     "jitter_px": round(float(summary["jitter_px"]), 3),
                     "weight": round(float(summary["weight"]), 3),
                 })
-                self._log(f"[HELIOS] {self.i + 1}/{n} {self.labels[self.i]} KABUL: "
-                          f"px=({summary['px']:.1f},{summary['py']:.1f}) area={summary['area']:.1f} "
-                          f"jitter={summary['jitter_px']:.1f}px w={summary['weight']:.2f} obs={obs}/{HELIOS_MEASURE_FR} "
-                          f"diag(maxscore={self.diag_maxscore} nabove={self.diag_nabove} thr={LASER_DIFF_MIN} minarea={LASER_MIN_AREA})")
+                log(f"[HELIOS] {self.i + 1}/{n} {self.labels[self.i]}: pan={p:.1f} tilt={t:.1f}"
+                    f" -> px=({summary['px']:.1f},{summary['py']:.1f}) jitter={summary['jitter_px']:.1f}px")
             else:
-                self._log(f"[HELIOS] {self.i + 1}/{n} {self.labels[self.i]} RED: {err or 'bilinmeyen'} "
-                          f"(obs={obs}/{HELIOS_MEASURE_FR}) "
-                          f"diag(maxscore={self.diag_maxscore} nabove={self.diag_nabove} thr={LASER_DIFF_MIN} minarea={LASER_MIN_AREA})  "
-                          f"# maxscore<thr -> nokta soluk (eşik); maxscore>=thr & nabove az -> blob küçük (morfoloji)")
+                log(f"[HELIOS] {self.i + 1}/{n} {self.labels[self.i]}: RED ({err or 'bilinmeyen'})")
             self.i += 1
             if self.i >= n:
                 self.phase = "done"
                 self.result = _fit_pixel_to_servo(self.samples)
-                if self.result is not None:
-                    self._log(f"FIT: model={self.result['model_type']} n={self.result['n_samples']} "
-                              f"rms={self.result['rms_pan_deg']}/{self.result['rms_tilt_deg']}° "
-                              f"reproj={self.result['reprojection_error_px']}px "
-                              f"span={self.result.get('px_span_x')}x{self.result.get('px_span_y')}px")
-                else:
-                    self._log(f"FIT BAŞARISIZ: tutarlı model çıkmadı ({len(self.samples)} kabul edilen örnek)")
                 return {"laser": False, "done": True,
                         "status": f"Bitti — {len(self.samples)}/{n} nokta",
                         "result": self.result}
@@ -3192,7 +3099,6 @@ def main(argv=None) -> None:
             if not boundary_cal_active and boundary_cal is not None:
                 boundary_cal = None
             if not helios_cal_active and helios_cal is not None:
-                helios_cal.close("iptal/durdurma")
                 helios_cal = None
 
             if boundary_cal_active:
@@ -3281,24 +3187,7 @@ def main(argv=None) -> None:
                     helios_cal = HeliosCalibrator()
                     ACTIVE_MOVE_DURATION = HELIOS_MOVE_DURATION
                     log("[HELIOS-KAL] Başladı.")
-                try:
-                    cmd = helios_cal.update(small)
-                except Exception:
-                    import traceback
-                    helios_cal._log("İSTİSNA (update):\n" + traceback.format_exc())
-                    helios_cal.close("İSTİSNA ile sonlandı")
-                    helios_cal = None
-                    helios_cal_active = False
-                    helios_cal_status = "BAŞARISIZ — istisna (log'a yazıldı)"
-                    ACTIVE_MOVE_DURATION = SERVO_MOVE_DURATION
-                    sim_laser_on = False
-                    if HAS_GPIO and lazer:
-                        lazer.off()
-                    with data_lock:
-                        target_pan_deg = PAN_HOME_DEG
-                        target_tilt_deg = TILT_HOME_DEG
-                    frame_idx += 1
-                    continue
+                cmd = helios_cal.update(small)
 
                 if "pan" in cmd:
                     with data_lock:
@@ -3338,15 +3227,9 @@ def main(argv=None) -> None:
                             f"rms {res['rms_pan_deg']}/{res['rms_tilt_deg']}°, "
                             f"reproj {res['reprojection_error_px']}px"
                         )
-                        if helios_cal:
-                            helios_cal._log("SONUÇ: KAYDEDİLDİ — " + helios_cal_status)
                     else:
                         helios_cal_status = f"BAŞARISIZ — {reason}"
                         log(f"[HELIOS-KAL] Başarısız: {reason}.")
-                        if helios_cal:
-                            helios_cal._log("SONUÇ: BAŞARISIZ (kullanılamaz harita) — " + reason)
-                    if helios_cal:
-                        helios_cal.close("tamamlandı")
                     helios_cal_active = False
                     helios_cal = None
                     ACTIVE_MOVE_DURATION = SERVO_MOVE_DURATION
