@@ -44,18 +44,17 @@ TILT_PWM_CHANNEL = 1     # GPIO13 = PWM1
 PWM_FREQ_HZ = 50         # 20 ms periyot
 
 # --- Kalibre edilmiş hareket aralığı (new2.py ile aynı) ---
-PAN_MIN_DEG, PAN_MAX_DEG = -30.25, 30.25
-TILT_MIN_DEG, TILT_MAX_DEG = -9.5, 9.5
-TILT_ZERO_OFFSET = 26.5          # gösterge 0° = fiziksel orta (aralığın merkezi)
-PAN_ZERO_OFFSET = -17.25         # gösterge 0° = fiziksel orta (aralığın merkezi)
+PAN_MIN_DEG, PAN_MAX_DEG = -50.0, 13.0
+TILT_MIN_DEG, TILT_MAX_DEG = -20.0, 45.0
+TILT_ZERO_OFFSET = 25.0          # gösterge 0° = fiziksel alt limit
 
 # Yön-dönüşü anti-backlash (wind-up) — yön değişince önce ESKI yönde NUDGE
 # kadar gidip o flank'i ön-yükler, kısa bekler, sonra hedefe döner. Net konum
 # hedefe eşit (drift yok); yalnız dönüş yolu değişir. NUDGE'i fiziksel dişli
 # boşluğu kadar ayarla; PAUSE servonun nudge'i fiziksel yapması için bekleme.
 # ponytail: tek knob (NUDGE). Pan/tilt ayrı.
-REVERSAL_NUDGE_PAN_DEG = 2.0
-REVERSAL_NUDGE_TILT_DEG = 2.0
+REVERSAL_NUDGE_PAN_DEG = 1.0
+REVERSAL_NUDGE_TILT_DEG = 1.0
 REVERSAL_NUDGE_PAUSE = 0.1
 pan_move_dir = 0
 tilt_move_dir = 0
@@ -115,7 +114,7 @@ tilt_servo = HardwarePWMServo(TILT_PWM_CHANNEL)
 
 
 def pan_to_servo_angle(deg: float) -> float:
-    return deg + PAN_ZERO_OFFSET
+    return deg
 
 
 def tilt_to_servo_angle(deg: float) -> float:

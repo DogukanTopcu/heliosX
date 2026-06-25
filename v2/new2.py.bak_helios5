@@ -190,7 +190,7 @@ LASER_DIFF_MIN     = 40     # lazer açık-kapalı parlaklık farkı eşiği (do
 LASER_MIN_AREA     = 2      # px², bu alandan küçük lekeler yok sayılır
 AUTOCAL_MIN_SAMPLES = 18
 HELIOS_MIN_SAMPLES = 9   # helios: 9-nokta sınır kalibrasyonu
-HELIOS_SETTLE_FR = 15    # helios: VARIŞTAN sonra kamera oturma bekleme (~0.5s@30fps)
+HELIOS_SETTLE_FR = 120   # helios: yavaş hareket için uzun oturma (~4s@30fps)
 HELIOS_MEASURE_FR = 20   # helios: nokta başına ölçüm frame'i
 HELIOS_MOVE_DURATION = 2.5  # helios: servo hareketi (%90 yavaş; normal 0.25s)
 AUTOCAL_MIN_SPAN_RATIO = 0.67
@@ -763,10 +763,8 @@ def _summarize_home_dot_samples(dots: list[tuple[float, float, float]]) -> tuple
 class HeliosCalibrator:
     """Helios kalibrasyon: önce tam pan+tilt taraması (mekanik/backlash ısıtma),
     sonra 9 sabit noktada (orta + 8 sınır) lazer noktasını ölçüp pixel->servo
-    haritasını fit eder. Main loop her frame update() çağırır.
-    Hareket 'blocking' ve yavaş olduğundan, faz ilerlemesi frame saymaya değil
-    servonun gerçekten VARMASINA bağlıdır (current_* == hedef) — yoksa hızlı FPS'te
-    kalibratör servoyu geçip eski hedefleri kovalatır ('saçma yere dönme')."""
+    haritasını fit eder. Noktalar doğrudan boundary sabitlerinden gelir.
+    Main loop her frame update() çağırır; AutoCalibrator ile aynı sözleşme."""
 
     def __init__(self) -> None:
         pmin, pmax = PAN_MIN_DEG, PAN_MAX_DEG
@@ -774,10 +772,10 @@ class HeliosCalibrator:
         # Tam tarama ısıtması (ölçüm yok): pan min->max->0, tilt min->max->0
         self.sweep = [(pmin, 0.0), (pmax, 0.0), (0.0, 0.0),
                       (0.0, tmin), (0.0, tmax), (0.0, 0.0)]
-        # 9 ölçüm noktası: orta, sağ orta, sağ üst, üst orta, sol üst,
-        # sol orta, sol alt, alt orta, sağ alt (tek eksen yürüyüş)
-        self.grid = [(0.0, 0.0), (pmin, 0.0), (pmin, tmax), (0.0, tmax),
-                     (pmax, tmax), (pmax, 0.0), (pmax, tmin), (0.0, tmin), (pmin, tmin)]
+        # 9 ölçüm noktası (kullanıcı sırası):
+        # orta, sağ üst, üst orta, sol üst, sol orta, sol alt, alt orta, sağ alt, sağ orta
+        self.grid = [(0.0, 0.0), (pmax, 0.0), (pmax, tmax), (0.0, tmax),
+                     (pmin, tmax), (pmin, 0.0), (pmin, tmin), (0.0, tmin), (pmax, tmin)]
         self.labels = ["orta", "sağ orta", "sağ üst", "üst orta", "sol üst",
                        "sol orta", "sol alt", "alt orta", "sağ alt"]
         self.sweep_i = 0
@@ -792,18 +790,11 @@ class HeliosCalibrator:
         self.dot_samples: list = []
         self.last_dot = None
 
-    def _arrived(self, p: float, t: float) -> bool:
-        # current_pan_deg/current_tilt_deg motor_smooth_thread tarafından güncellenir
-        return abs(current_pan_deg - p) <= 0.15 and abs(current_tilt_deg - t) <= 0.15
-
     def update(self, small_bgr) -> dict:
         n = len(self.grid)
 
         if self.phase == "sweep":
             p, t = self.sweep[self.sweep_i]
-            if not self._arrived(p, t):
-                return {"pan": p, "tilt": t, "laser": False, "done": False,
-                        "status": self.status + " (gidiyor)"}
             self.counter -= 1
             if self.counter > 0:
                 return {"pan": p, "tilt": t, "laser": False, "done": False, "status": self.status}
@@ -834,11 +825,8 @@ class HeliosCalibrator:
             return {"pan": 0.0, "tilt": 0.0, "laser": False, "done": False, "status": self.status}
 
         if self.phase == "settle":
-            p, t = self.grid[self.i]
-            if not self._arrived(p, t):
-                return {"pan": p, "tilt": t, "laser": True, "done": False,
-                        "status": self.status + " (gidiyor)"}
             self.counter -= 1
+            p, t = self.grid[self.i]
             if self.counter > 0:
                 return {"pan": p, "tilt": t, "laser": True, "done": False, "status": self.status}
             self.phase = "measure"
@@ -883,6 +871,7 @@ class HeliosCalibrator:
             return {"pan": np_, "tilt": nt, "laser": True, "done": False, "status": self.status}
 
         return {"laser": False, "done": True, "status": self.status, "result": self.result}
+
 
 class AutoCalibrator:
     """Servoları ızgarada gezdirip her noktada lazer noktasını tespit eder,

@@ -61,6 +61,18 @@ class CalibrationTests(unittest.TestCase):
         self.assertIsNone(summary)
         self.assertIn("jitter", error)
 
+    def test_boundary_home_summary_is_more_tolerant_than_regular_summary(self):
+        home_noisy = [(10.0 + math.cos(i) * 11.0, 10.0 + math.sin(i) * 11.0, 4.0)
+                      for i in range(10)]
+        summary, error = turret._summarize_dot_samples(home_noisy)
+        self.assertIsNone(summary)
+        self.assertIn("jitter", error)
+
+        summary, error = turret._summarize_home_dot_samples(home_noisy)
+        self.assertIsNone(error)
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["weight"], 0.25)
+
     def test_linear_model_is_preferred_for_linear_data(self):
         result = turret._fit_pixel_to_servo(make_linear_samples())
         self.assertEqual(result["model_type"], "linear")
@@ -126,6 +138,40 @@ class CalibrationTests(unittest.TestCase):
         data["process_width"] += 1
         self.assertIn("process_width", turret._calibration_compatibility_error(data))
 
+    def test_boundary_safe_area_is_shrunk_from_discovered_limits(self):
+        safe = turret._boundary_safe_area({
+            "left": {"pan": -4.5, "tilt": 5.0, "px": 100.0, "py": 170.0},
+            "right": {"pan": 4.5, "tilt": 5.0, "px": 540.0, "py": 170.0},
+            "up": {"pan": 0.0, "tilt": 9.0, "px": 320.0, "py": 70.0},
+            "down": {"pan": 0.0, "tilt": 1.0, "px": 320.0, "py": 280.0},
+        })
+        self.assertIsNotNone(safe)
+        self.assertAlmostEqual(safe["pan_min"], -4.25)
+        self.assertAlmostEqual(safe["pan_max"], 4.25)
+        self.assertAlmostEqual(safe["tilt_min"], 1.25)
+        self.assertAlmostEqual(safe["tilt_max"], 8.75)
+        self.assertEqual(len(safe["safe_polygon"]), 4)
+        self.assertGreaterEqual(len(safe["boundary_hull"]), 3)
+
+    def test_boundary_grid_plan_stays_inside_safe_area(self):
+        safe = turret._boundary_safe_area({
+            "left": {"pan": -4.5, "tilt": 5.0, "px": 100.0, "py": 170.0},
+            "right": {"pan": 4.5, "tilt": 5.0, "px": 540.0, "py": 170.0},
+            "up": {"pan": 0.0, "tilt": 9.0, "px": 320.0, "py": 70.0},
+            "down": {"pan": 0.0, "tilt": 1.0, "px": 320.0, "py": 280.0},
+        })
+        plan = turret._boundary_grid_plan(safe)
+        self.assertEqual(len(plan), turret.AUTOCAL_GRID_PAN * turret.AUTOCAL_GRID_TILT)
+        for point in plan:
+            self.assertGreaterEqual(point["pan"], safe["pan_min"])
+            self.assertLessEqual(point["pan"], safe["pan_max"])
+            self.assertGreaterEqual(point["tilt"], safe["tilt_min"])
+            self.assertLessEqual(point["tilt"], safe["tilt_max"])
+            self.assertGreaterEqual(point["planned_px"], safe["x_min"])
+            self.assertLessEqual(point["planned_px"], safe["x_max"])
+            self.assertGreaterEqual(point["planned_py"], safe["y_min"])
+            self.assertLessEqual(point["planned_py"], safe["y_max"])
+
     def test_saved_map_round_trips_with_schema_and_reachable_hull(self):
         result = turret._fit_pixel_to_servo(make_linear_samples())
         with tempfile.TemporaryDirectory() as directory:
@@ -140,6 +186,87 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(turret.MAP_MODEL_TYPE, "linear")
         self.assertEqual(len(turret.CALIBRATION_SAMPLES), 30)
         self.assertGreaterEqual(len(turret.REACHABLE_HULL), 3)
+
+    def test_boundary_grid_save_persists_mode_and_metadata(self):
+        result = turret._fit_pixel_to_servo(make_linear_samples())
+        result.update({
+            "boundary_points": {
+                "left": {"pan": -4.5, "tilt": 5.0, "px": 100.0, "py": 170.0},
+                "right": {"pan": 4.5, "tilt": 5.0, "px": 540.0, "py": 170.0},
+                "up": {"pan": 0.0, "tilt": 9.0, "px": 320.0, "py": 70.0},
+                "down": {"pan": 0.0, "tilt": 1.0, "px": 320.0, "py": 280.0},
+            },
+            "safe_polygon": [[110.0, 80.0], [530.0, 80.0], [530.0, 270.0], [110.0, 270.0]],
+            "generated_grid_points": [{"pan": 0.0, "tilt": 5.0, "planned_px": 320.0, "planned_py": 175.0}],
+            "accepted_samples": result["samples"],
+            "rejected_samples": [{"pan": 0.0, "tilt": 0.0, "reason": "frame kenarı"}],
+            "home_sample": {"pan": 0.0, "tilt": 0.0, "px": 320.0, "py": 180.0},
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "calibration.json")
+            with patch.object(turret, "CALIB_PATH", path):
+                turret._save_pixel_map(result, mode="boundary_grid")
+                with open(path) as fh:
+                    data = turret._json.load(fh)
+                turret.HAS_PIXEL_MAP = False
+                turret.CALIBRATION_SAMPLES = []
+                turret.REACHABLE_HULL = None
+                turret._load_calibration()
+        self.assertEqual(data["mode"], "boundary_grid")
+        self.assertIn("boundary_points", data)
+        self.assertIn("generated_grid_points", data)
+        self.assertTrue(turret.HAS_PIXEL_MAP)
+
+    def test_boundary_grid_calibrator_discovers_area_and_fits_map(self):
+        dummy = np.zeros((turret.PROCESS_H, turret.PROCESS_W, 3), dtype=np.uint8)
+        with patch.object(turret, "AUTOCAL_REF_FR", 1), \
+             patch.object(turret, "AUTOCAL_SETTLE_FR", 1), \
+             patch.object(turret, "AUTOCAL_MEASURE_FR", 2), \
+             patch.object(turret, "AUTOCAL_MIN_OBSERVATIONS", 1):
+            calibrator = turret.BoundaryGridCalibrator()
+
+            def fake_detect(_frame, _ref=None):
+                if "measure" not in calibrator.phase:
+                    return None
+                pan, tilt = calibrator.current_target
+                px = 320.0 + pan * 10.0
+                py = 220.0 - tilt * 7.0
+                return (px, py, 4.0)
+
+            with patch.object(turret, "_detect_laser_dot", side_effect=fake_detect):
+                cmd = None
+                for _ in range(500):
+                    cmd = calibrator.update(dummy)
+                    if cmd["done"]:
+                        break
+
+        self.assertIsNotNone(cmd)
+        self.assertTrue(cmd["done"])
+        self.assertIsNotNone(cmd["result"])
+        self.assertEqual(cmd["result"]["model_type"], "linear")
+        self.assertEqual(set(cmd["result"]["boundary_points"]),
+                         {"left", "right", "up", "down"})
+        self.assertEqual(len(cmd["result"]["generated_grid_points"]),
+                         turret.AUTOCAL_GRID_PAN * turret.AUTOCAL_GRID_TILT)
+
+    def test_boundary_grid_calibrator_fails_when_home_dot_missing(self):
+        dummy = np.zeros((turret.PROCESS_H, turret.PROCESS_W, 3), dtype=np.uint8)
+        with patch.object(turret, "AUTOCAL_REF_FR", 1), \
+             patch.object(turret, "AUTOCAL_SETTLE_FR", 1), \
+             patch.object(turret, "AUTOCAL_MEASURE_FR", 2), \
+             patch.object(turret, "AUTOCAL_MIN_OBSERVATIONS", 1), \
+             patch.object(turret, "_detect_laser_dot", return_value=None):
+            calibrator = turret.BoundaryGridCalibrator()
+            cmd = None
+            for _ in range(20):
+                cmd = calibrator.update(dummy)
+                if cmd["done"]:
+                    break
+
+        self.assertIsNotNone(cmd)
+        self.assertTrue(cmd["done"])
+        self.assertIsNone(cmd["result"])
+        self.assertIn("home", cmd["status"].lower())
 
 
 if __name__ == "__main__":

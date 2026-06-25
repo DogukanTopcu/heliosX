@@ -45,8 +45,8 @@ PWM_FREQ_HZ = 50         # 20 ms periyot
 
 # --- Kalibre edilmiş hareket aralığı (new2.py ile aynı) ---
 PAN_MIN_DEG, PAN_MAX_DEG = -30.25, 30.25
-TILT_MIN_DEG, TILT_MAX_DEG = -9.5, 9.5
-TILT_ZERO_OFFSET = 26.5          # gösterge 0° = fiziksel orta (aralığın merkezi)
+TILT_MIN_DEG, TILT_MAX_DEG = -20.0, 45.0
+TILT_ZERO_OFFSET = 25.0          # gösterge 0° = fiziksel alt limit
 PAN_ZERO_OFFSET = -17.25         # gösterge 0° = fiziksel orta (aralığın merkezi)
 
 # Yön-dönüşü anti-backlash (wind-up) — yön değişince önce ESKI yönde NUDGE
@@ -54,8 +54,8 @@ PAN_ZERO_OFFSET = -17.25         # gösterge 0° = fiziksel orta (aralığın me
 # hedefe eşit (drift yok); yalnız dönüş yolu değişir. NUDGE'i fiziksel dişli
 # boşluğu kadar ayarla; PAUSE servonun nudge'i fiziksel yapması için bekleme.
 # ponytail: tek knob (NUDGE). Pan/tilt ayrı.
-REVERSAL_NUDGE_PAN_DEG = 2.0
-REVERSAL_NUDGE_TILT_DEG = 2.0
+REVERSAL_NUDGE_PAN_DEG = 1.0
+REVERSAL_NUDGE_TILT_DEG = 1.0
 REVERSAL_NUDGE_PAUSE = 0.1
 pan_move_dir = 0
 tilt_move_dir = 0

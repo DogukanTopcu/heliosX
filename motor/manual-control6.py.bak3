@@ -44,19 +44,16 @@ TILT_PWM_CHANNEL = 1     # GPIO13 = PWM1
 PWM_FREQ_HZ = 50         # 20 ms periyot
 
 # --- Kalibre edilmiş hareket aralığı (new2.py ile aynı) ---
-PAN_MIN_DEG, PAN_MAX_DEG = -30.25, 30.25
-TILT_MIN_DEG, TILT_MAX_DEG = -9.5, 9.5
-TILT_ZERO_OFFSET = 26.5          # gösterge 0° = fiziksel orta (aralığın merkezi)
-PAN_ZERO_OFFSET = -17.25         # gösterge 0° = fiziksel orta (aralığın merkezi)
+PAN_MIN_DEG, PAN_MAX_DEG = -50.0, 13.0
+TILT_MIN_DEG, TILT_MAX_DEG = -20.0, 45.0
+TILT_ZERO_OFFSET = 25.0          # gösterge 0° = fiziksel alt limit
 
-# Yön-dönüşü anti-backlash (wind-up) — yön değişince önce ESKI yönde NUDGE
-# kadar gidip o flank'i ön-yükler, kısa bekler, sonra hedefe döner. Net konum
-# hedefe eşit (drift yok); yalnız dönüş yolu değişir. NUDGE'i fiziksel dişli
-# boşluğu kadar ayarla; PAUSE servonun nudge'i fiziksel yapması için bekleme.
-# ponytail: tek knob (NUDGE). Pan/tilt ayrı.
-REVERSAL_NUDGE_PAN_DEG = 2.0
-REVERSAL_NUDGE_TILT_DEG = 2.0
-REVERSAL_NUDGE_PAUSE = 0.1
+# Dişli boşluğu (backlash) telafisi — çıkışı hareket yönünde yarım boşluk
+# kadar kaydırır; yön dönünce slack tek adımda (BACKLASH kadar) yutulur.
+# Atlama hâlâ varsa büyüt, hedefi aşıyorsa küçült. Pan/tilt ayrı ayarlanır.
+# ponytail: hysteresis comp; tek knob. Oturmazsa per-target premove'a geç.
+BACKLASH_PAN_DEG = 0.5
+BACKLASH_TILT_DEG = 0.5
 pan_move_dir = 0
 tilt_move_dir = 0
 
@@ -115,7 +112,7 @@ tilt_servo = HardwarePWMServo(TILT_PWM_CHANNEL)
 
 
 def pan_to_servo_angle(deg: float) -> float:
-    return deg + PAN_ZERO_OFFSET
+    return deg
 
 
 def tilt_to_servo_angle(deg: float) -> float:
@@ -138,29 +135,16 @@ def motor_smooth_thread() -> None:
             t_pan, t_tilt = target_pan_deg, target_tilt_deg
         pan_diff = t_pan - current_pan_deg
         if abs(pan_diff) > threshold:
-            new_dir = 1 if pan_diff > 0 else -1
-            if pan_move_dir and new_dir != pan_move_dir:
-                # once ESKI yonde nudge (flank on-yukleme), bekle, sonra hedefe don
-                current_pan_deg = max(PAN_MIN_DEG, min(PAN_MAX_DEG,
-                    current_pan_deg + pan_move_dir * REVERSAL_NUDGE_PAN_DEG))
-                pan_servo.angle = pan_to_servo_angle(current_pan_deg)
-                time.sleep(REVERSAL_NUDGE_PAUSE)
-                pan_diff = t_pan - current_pan_deg
-            pan_move_dir = new_dir
+            pan_move_dir = 1 if pan_diff > 0 else -1
             current_pan_deg += pan_diff * smooth_factor
-            pan_servo.angle = pan_to_servo_angle(current_pan_deg)
+            pan_servo.angle = pan_to_servo_angle(
+                current_pan_deg + pan_move_dir * BACKLASH_PAN_DEG / 2)
         tilt_diff = t_tilt - current_tilt_deg
         if abs(tilt_diff) > threshold:
-            new_dir = 1 if tilt_diff > 0 else -1
-            if tilt_move_dir and new_dir != tilt_move_dir:
-                current_tilt_deg = max(TILT_MIN_DEG, min(TILT_MAX_DEG,
-                    current_tilt_deg + tilt_move_dir * REVERSAL_NUDGE_TILT_DEG))
-                tilt_servo.angle = tilt_to_servo_angle(current_tilt_deg)
-                time.sleep(REVERSAL_NUDGE_PAUSE)
-                tilt_diff = t_tilt - current_tilt_deg
-            tilt_move_dir = new_dir
+            tilt_move_dir = 1 if tilt_diff > 0 else -1
             current_tilt_deg += tilt_diff * smooth_factor
-            tilt_servo.angle = tilt_to_servo_angle(current_tilt_deg)
+            tilt_servo.angle = tilt_to_servo_angle(
+                current_tilt_deg + tilt_move_dir * BACKLASH_TILT_DEG / 2)
         time.sleep(0.005)
 
 
